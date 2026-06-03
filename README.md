@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Elephant Tracking Data Cleaner
 
 A Shiny app for cleaning elephant GPS collar data. Upload raw CSV files, flag erroneous fixes, review and remove them, and export a cleaned dataset with audit files.
@@ -108,3 +109,4 @@ A summary view showing:
 - A Gantt chart of temporal coverage per individual
 - A heatmap of fix counts by individual and month
 - A processing summary table per individual
+=======
