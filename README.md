@@ -7,12 +7,17 @@ A Shiny app for cleaning elephant GPS collar data. Upload raw CSV files, flag er
 ### Requirements
 
 - R (≥ 4.1)
-- RStudio
+- RStudio (recommended, but any R console will work)
 
 ### Installation
 
 1. Clone or download this repository
-2. Open the `.Rproj` file in RStudio
+2. Open the `.Rproj` file in RStudio, or set your working directory to the repository folder in R:
+
+```r
+setwd("path/to/Tracking_data_cleaner_shiny")
+```
+
 3. Restore package dependencies:
 
 ```r
