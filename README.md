@@ -18,9 +18,10 @@ A Shiny app for cleaning elephant GPS collar data. Upload raw CSV files, flag er
 setwd("path/to/Tracking_data_cleaner_shiny")
 ```
 
-3. Restore package dependencies:
+3. Install `renv` if you don't already have it, then restore package dependencies:
 
 ```r
+install.packages("renv")
 renv::restore()
 ```
 
