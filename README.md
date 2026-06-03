@@ -11,6 +11,8 @@ A Shiny app for cleaning elephant GPS collar data. Upload raw CSV files, flag er
 
 ### Installation
 
+> **Important:** Do not save the app folder in `C:/Program Files/` or any other protected Windows directory. R will not have permission to install packages there. Save it somewhere in your user space, e.g. `C:/Users/YourName/Documents/`.
+
 1. Clone or download this repository
 2. Open the `.Rproj` file in RStudio, or set your working directory to the repository folder in R:
 
@@ -18,11 +20,15 @@ A Shiny app for cleaning elephant GPS collar data. Upload raw CSV files, flag er
 setwd("path/to/Tracking_data_cleaner_shiny")
 ```
 
-3. Install `renv` if you don't already have it, then restore package dependencies:
+3. Install the required packages:
 
 ```r
-install.packages("renv")
-renv::restore()
+install.packages(c(
+  "shiny", "bslib", "bsicons", "dplyr", "lubridate", "sf",
+  "leaflet", "leaflet.extras", "DT", "plotly", "readr",
+  "stringr", "lutz", "rnaturalearth", "purrr", "fs",
+  "tidyr", "ggplot2"
+))
 ```
 
 4. Run the app:
