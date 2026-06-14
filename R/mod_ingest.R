@@ -131,12 +131,14 @@ mod_ingest_ui <- function(id) {
       tags$ol(style = "font-size:0.78rem; padding-left:1.2rem; color:#6c757d; margin-bottom:0.5rem;",
         tags$li("Apply name corrections (if CSV uploaded above)"),
         tags$li("Standardise column names"),
+        tags$li("Remove rows with blank or NA individual name"),
         tags$li("Filter to elephant species"),
         tags$li("Standardise sex values"),
         tags$li("Parse & validate lat/lon coordinates (removes NAs, out-of-range values, and (0, 0) fixes)"),
         tags$li("Parse timestamps"),
         tags$li("Detect timezone from coordinates"),
         tags$li("Project to UTM (EPSG auto-calculated from data extent)"),
+        tags$li("Split EarthRanger individuals with multiple grouping IDs (groupby_col) whose date ranges overlap (e.g. Louise→Louise_1, Louise_2) — sequential recollaring with no overlap is left intact; only applies if EarthRanger checkbox is ticked"),
         tags$li("Remove duplicate fixes"),
         tags$li("Remove fixes within 5 minutes of the previous fix per individual")
       ),
@@ -148,11 +150,15 @@ mod_ingest_ui <- function(id) {
       ) # close ingest-left div
     ),
 
-    # Right: summary boxes + preview
-    card(
-      card_header("Preview"),
-      uiOutput(ns("summary_boxes")),
-      DTOutput(ns("preview"))
+    # Right: summary boxes + preview, then separate individual summary card
+    tagList(
+      card(
+        fill = FALSE,
+        card_header("Preview"),
+        uiOutput(ns("summary_boxes")),
+        DTOutput(ns("preview"))
+      ),
+      uiOutput(ns("ind_summary_ui"))
     )
   )
 }
@@ -179,10 +185,14 @@ mod_ingest_server <- function(id, rv, parent_session) {
     # corrections section stable so re-running corrections doesn't reset the fileInput.
     data_prepared <- reactiveVal(FALSE)
 
+    # Per-file summary: file name | raw rows | after per-file prep | final (after cross-file dedup)
+    ingest_file_summary <- reactiveVal(NULL)
+
     # ── Reset when Start Over clears rv$study_area ─────────────────────────
     observeEvent(rv$study_area, {
       req(is.null(rv$study_area))
       file_samples(list())
+      ingest_file_summary(NULL)
       updateTextInput(session,  "study_area", value = "")
       updateNumericInput(session, "crs_xy",   value = NA)
     }, ignoreNULL = FALSE, ignoreInit = TRUE)
@@ -262,6 +272,18 @@ mod_ingest_server <- function(id, rv, parent_session) {
               "Timestamps are in UTC (uncheck if already stored in local time)",
               value = TRUE
             ),
+
+            # ── EarthRanger collar split (only shown when groupby_col present) ──
+            if (!is.null(samp) && "groupby_col" %in% names(samp)) {
+              tagList(
+                tags$hr(style = "margin:0.5rem 0;"),
+                checkboxInput(
+                  session$ns(paste0("earthranger_", i)),
+                  "EarthRanger data — split individuals with multiple grouping IDs (groupby_col) with overlapping date ranges (sequential recollaring is left intact)",
+                  value = TRUE
+                )
+              )
+            },
 
             tags$hr(style = "margin:0.5rem 0;"),
 
@@ -423,6 +445,9 @@ mod_ingest_server <- function(id, rv, parent_session) {
           file_paths <- input$files$datapath
           file_names <- input$files$name
 
+          raw_row_counts    <- integer(length(file_paths))
+          prepped_row_counts <- integer(length(file_paths))
+
           prepped_list <- lapply(seq_along(file_paths), function(i) {
             samp       <- if (i <= length(samps)) samps[[i]] else NULL
             has_sp_col <- !is.null(samp) && "species" %in% tolower(names(samp))
@@ -437,6 +462,33 @@ mod_ingest_server <- function(id, rv, parent_session) {
             fcol <- trimws(input[[paste0("filter_col_", i)]] %||% "")
             fval <- trimws(input[[paste0("filter_val_", i)]] %||% "")
 
+            # ── Capture actual row count from the full file ─────────────────
+            raw_row_counts[[i]] <<- tryCatch({
+              d <- readr::read_csv(
+                file_paths[i],
+                col_select     = 1,
+                col_types      = readr::cols(.default = readr::col_character()),
+                locale         = readr::locale(encoding = "latin1"),
+                show_col_types = FALSE
+              )
+              if (nzchar(fcol) && nzchar(fval)) {
+                samp_i <- if (i <= length(samps)) samps[[i]] else NULL
+                if (!is.null(samp_i) && fcol %in% names(samp_i)) {
+                  # read full file with filter column to get accurate filtered count
+                  d2 <- tryCatch(readr::read_csv(
+                    file_paths[i],
+                    col_select     = dplyr::all_of(fcol),
+                    col_types      = readr::cols(.default = readr::col_character()),
+                    locale         = readr::locale(encoding = "latin1"),
+                    show_col_types = FALSE
+                  ), error = function(e) NULL)
+                  if (!is.null(d2))
+                    return(sum(as.character(d2[[fcol]]) == fval, na.rm = TRUE))
+                }
+              }
+              nrow(d)
+            }, error = function(e) NA_integer_)
+
             tryCatch({
               prepped <- prep_elephant_csv(
                 file_paths[i],
@@ -447,7 +499,8 @@ mod_ingest_server <- function(id, rv, parent_session) {
                 all_elephant       = all_elephant,
                 filter_elephant    = filter_elephant,
                 include_na_species = include_na_species,
-                timestamps_utc     = isTRUE(input[[paste0("timestamps_utc_", i)]])
+                timestamps_utc     = isTRUE(input[[paste0("timestamps_utc_", i)]]),
+                earthranger        = isTRUE(input[[paste0("earthranger_", i)]])
               )
               # Apply name corrections per-file so that combine_prepped sees
               # canonical names and its rolling 5-minute dedup correctly merges
@@ -470,6 +523,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
                   dplyr::mutate(name = dplyr::coalesce(canonical, name)) %>%
                   dplyr::select(-canonical)
               }
+              prepped_row_counts[[i]] <<- if (!is.null(prepped)) nrow(prepped) else 0L
               prepped
             },
             error = function(e) {
@@ -487,6 +541,21 @@ mod_ingest_server <- function(id, rv, parent_session) {
           }
 
           dat <- combine_prepped(prepped_list)
+
+          ingest_file_summary(
+            tibble::tibble(
+              File          = file_names,
+              `CSV rows`    = raw_row_counts,
+              `After prep`  = prepped_row_counts
+            ) %>%
+              dplyr::bind_rows(
+                tibble::tibble(
+                  File         = "TOTAL after cross-file dedup",
+                  `CSV rows`   = sum(raw_row_counts),
+                  `After prep` = nrow(dat)
+                )
+              )
+          )
 
           gaps_h <- dat %>%
             sf::st_drop_geometry() %>%
@@ -611,6 +680,42 @@ mod_ingest_server <- function(id, rv, parent_session) {
        ),
        extensions = "FixedColumns",
        class = "compact cell-border stripe")
+
+    # ── Per-individual summary (shown after preparation) ───────────────────
+    output$ind_summary_ui <- renderUI({
+      req(rv$data_raw)
+      tagList(
+        card(
+          card_header("Automated preparation summary"),
+          DTOutput(session$ns("file_summary_tbl"))
+        ),
+        card(
+          card_header("Per-individual summary"),
+          DTOutput(session$ns("ind_summary"))
+        )
+      )
+    })
+
+    output$file_summary_tbl <- renderDT({
+      req(ingest_file_summary())
+      ingest_file_summary()
+    }, options = list(dom = "t", paging = FALSE, scrollX = TRUE),
+       rownames = FALSE, class = "compact cell-border stripe")
+
+    output$ind_summary <- renderDT({
+      req(rv$data_raw)
+      rv$data_raw %>%
+        sf::st_drop_geometry() %>%
+        dplyr::group_by(name) %>%
+        dplyr::summarise(
+          Fixes = dplyr::n(),
+          From  = format(min(timestamp_corrected, na.rm = TRUE), "%Y-%m-%d"),
+          To    = format(max(timestamp_corrected, na.rm = TRUE), "%Y-%m-%d"),
+          .groups = "drop"
+        ) %>%
+        dplyr::rename(Individual = name)
+    }, options = list(dom = "t", paging = FALSE, scrollX = TRUE),
+       rownames = FALSE, class = "compact cell-border stripe")
 
     # ── Individual pickers — re-renders when rv$data_raw changes so the lists
     # always reflect canonical names after corrections or exclusions are applied.

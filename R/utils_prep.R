@@ -135,7 +135,8 @@ prep_elephant_csv <- function(file,
                                all_elephant       = FALSE,
                                filter_elephant    = TRUE,
                                include_na_species = FALSE,
-                               timestamps_utc     = TRUE) {
+                               timestamps_utc     = TRUE,
+                               earthranger        = FALSE) {
 
   message("Processing: ", basename(file))
 
@@ -207,7 +208,15 @@ prep_elephant_csv <- function(file,
     nm_x <- pick_col(names(dat), c("name.x", "name.y"))
     if (!is.na(nm_x)) names(dat)[tolower(names(dat)) == tolower(nm_x)] <- "name"
   }
-  if ("name" %in% names(dat)) dat$name <- trimws(as.character(dat$name))
+  if ("name" %in% names(dat)) {
+    dat$name <- trimws(as.character(dat$name))
+    n_na <- sum(is.na(dat$name) | dat$name == "")
+    if (n_na > 0) {
+      message("Name filter: ", n_na, " row(s) with blank/NA name removed from ",
+              basename(file))
+      dat <- dplyr::filter(dat, !is.na(name), nzchar(name))
+    }
+  }
 
   # ── Species handling ───────────────────────────────────────────────────────
   # Normalise species column name to lowercase for consistent access
@@ -460,6 +469,7 @@ prep_elephant_csv <- function(file,
       x = sf::st_coordinates(.)[, 1],
       y = sf::st_coordinates(.)[, 2]
     ) %>%
+    { if (earthranger) .split_earthranger_collars(.) else . } %>%
     .dedup_consecutive("name", "timestamp_corrected", min_gap_mins = 5) %>%
     dplyr::arrange(name, timestamp_corrected)
 }
@@ -496,6 +506,78 @@ prep_elephant_csv <- function(file,
     }
   }
   df[keep, , drop = FALSE]
+}
+
+# ---------------------------------------------------------------------------
+# EarthRanger multi-collar split
+# ---------------------------------------------------------------------------
+# When one name has >1 unique groupby_col UUID the fixes come from different
+# collar deployments (possibly different animals sharing a name).  Rename each
+# group by appending _1, _2, … ordered by first timestamp of each collar so
+# that the subsequent .dedup_consecutive treats them as separate individuals.
+.split_earthranger_collars <- function(df) {
+  if (!"groupby_col" %in% names(df)) return(df)
+
+  df_plain <- sf::st_drop_geometry(df)
+
+  multi <- df_plain %>%
+    dplyr::filter(!is.na(groupby_col), nzchar(groupby_col)) %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarise(n_collars = dplyr::n_distinct(groupby_col), .groups = "drop") %>%
+    dplyr::filter(n_collars > 1)
+
+  if (nrow(multi) == 0) return(df)
+
+  # Get date range per individual × groupby_col
+  collar_ranges <- df_plain %>%
+    dplyr::filter(name %in% multi$name, !is.na(groupby_col), nzchar(groupby_col)) %>%
+    dplyr::group_by(name, groupby_col) %>%
+    dplyr::summarise(
+      rng_start = min(timestamp_corrected, na.rm = TRUE),
+      rng_end   = max(timestamp_corrected, na.rm = TRUE),
+      .groups   = "drop"
+    )
+
+  # For each individual, check whether any two groupby_col ranges overlap.
+  # Sequential recollaring (one ends before the next begins) is left intact.
+  overlapping_names <- collar_ranges %>%
+    dplyr::group_by(name) %>%
+    dplyr::group_map(function(d, key) {
+      n       <- nrow(d)
+      overlap <- FALSE
+      if (n >= 2) {
+        for (i in seq_len(n - 1)) {
+          for (j in seq(i + 1, n)) {
+            if (d$rng_start[i] <= d$rng_end[j] && d$rng_start[j] <= d$rng_end[i]) {
+              overlap <- TRUE
+              break
+            }
+          }
+          if (overlap) break
+        }
+      }
+      if (overlap) key$name else character(0)
+    }) %>%
+    unlist()
+
+  if (length(overlapping_names) == 0) return(df)
+
+  collar_order <- collar_ranges %>%
+    dplyr::filter(name %in% overlapping_names) %>%
+    dplyr::arrange(name, rng_start) %>%
+    dplyr::group_by(name) %>%
+    dplyr::mutate(suffix = seq_len(dplyr::n())) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(new_name = paste0(name, "_", suffix)) %>%
+    dplyr::select(name, groupby_col, new_name)
+
+  message("EarthRanger collar split (overlapping date ranges): ",
+          paste(overlapping_names, collapse = ", "))
+
+  df %>%
+    dplyr::left_join(collar_order, by = c("name", "groupby_col")) %>%
+    dplyr::mutate(name = dplyr::coalesce(new_name, name)) %>%
+    dplyr::select(-new_name)
 }
 
 # ---------------------------------------------------------------------------
@@ -580,3 +662,202 @@ compute_summary <- function(rv) {
 }
 
 `%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ---------------------------------------------------------------------------
+# Per-individual summary across all cleaning stages
+# ---------------------------------------------------------------------------
+
+build_individual_summary <- function(rv) {
+  if (is.null(rv$data_raw)) return(NULL)
+
+  raw_summary <- rv$data_raw %>%
+    sf::st_drop_geometry() %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarise(
+      raw_fixes  = dplyr::n(),
+      date_start = min(timestamp_corrected, na.rm = TRUE),
+      date_end   = max(timestamp_corrected, na.rm = TRUE),
+      .groups    = "drop"
+    )
+
+  flag_rm <- if (!is.null(rv$flagged_removals) && nrow(rv$flagged_removals) > 0)
+    dplyr::count(rv$flagged_removals, name, name = "flag_removed")
+  else
+    tibble::tibble(name = character(0), flag_removed = integer(0))
+
+  manual_rm <- if (!is.null(rv$manual_removals) && nrow(rv$manual_removals) > 0)
+    dplyr::count(rv$manual_removals, name, name = "manual_removed")
+  else
+    tibble::tibble(name = character(0), manual_removed = integer(0))
+
+  raw_summary %>%
+    dplyr::left_join(flag_rm,   by = "name") %>%
+    dplyr::left_join(manual_rm, by = "name") %>%
+    dplyr::mutate(
+      flag_removed   = dplyr::coalesce(flag_removed,   0L),
+      manual_removed = dplyr::coalesce(manual_removed, 0L),
+      clean_fixes    = raw_fixes - flag_removed - manual_removed
+    ) %>%
+    dplyr::transmute(
+      Individual       = name,
+      `Raw Fixes`      = raw_fixes,
+      `Flag Removed`   = flag_removed,
+      `Manual Removed` = manual_removed,
+      `Clean Fixes`    = clean_fixes,
+      `Date Range`     = paste0(format(date_start, "%Y-%m-%d"), " – ",
+                                format(date_end,   "%Y-%m-%d"))
+    )
+}
+
+# Per-individual flag-type breakdown (Step 3 view)
+build_ind_flag_breakdown <- function(rv) {
+  if (is.null(rv$data_flagged)) return(NULL)
+
+  dat     <- rv$data_flagged
+  auto_rm <- rv$flagged_removals
+
+  result <- dat %>%
+    sf::st_drop_geometry() %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarise(
+      in_data     = dplyr::n(),
+      ok          = sum(flag_type == "ok",                    na.rm = TRUE),
+      vehicle     = sum(flag_type == "suspicious_vehicle",    na.rm = TRUE),
+      airborne    = sum(flag_type == "suspicious_airborne",   na.rm = TRUE),
+      predep      = sum(flag_type == "predeployment",         na.rm = TRUE),
+      immobility  = sum(flag_type == "immobility",            na.rm = TRUE),
+      shift       = sum(flag_type == "shift_episode",         na.rm = TRUE),
+      .groups     = "drop"
+    )
+
+  spatial_counts <- if (!is.null(auto_rm) && nrow(auto_rm) > 0) {
+    auto_rm %>%
+      dplyr::filter(flag_type %in% c("outside_bbox", "hq")) %>%
+      dplyr::group_by(name) %>%
+      dplyr::summarise(
+        outside_bbox = sum(flag_type == "outside_bbox", na.rm = TRUE),
+        hq           = sum(flag_type == "hq",           na.rm = TRUE),
+        .groups      = "drop"
+      )
+  } else tibble::tibble(name = character(0), outside_bbox = integer(0), hq = integer(0))
+
+  result %>%
+    dplyr::left_join(spatial_counts, by = "name") %>%
+    dplyr::mutate(
+      outside_bbox = dplyr::coalesce(outside_bbox, 0L),
+      hq           = dplyr::coalesce(hq,           0L),
+      total        = in_data + outside_bbox + hq,
+      total_flagged= total - ok
+    ) %>%
+    dplyr::transmute(
+      Individual      = name,
+      Total           = total,
+      OK              = ok,
+      `Flagged`       = total_flagged,
+      Vehicle         = vehicle,
+      Airborne        = airborne,
+      `Pre-dep`       = predep,
+      Immobility      = immobility,
+      Shift           = shift,
+      `Outside bbox`  = outside_bbox,
+      HQ              = hq
+    )
+}
+
+# ---------------------------------------------------------------------------
+# Text cleaning report (Step 6 export)
+# ---------------------------------------------------------------------------
+
+.fmt_tbl <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return("  (none)")
+  df_chr <- as.data.frame(lapply(df, function(x) {
+    if (is.numeric(x)) formatC(x, format = "d", big.mark = ",") else as.character(x)
+  }), stringsAsFactors = FALSE, check.names = FALSE)
+  nms    <- names(df_chr)
+  widths <- mapply(function(col, nm) max(nchar(nm), max(nchar(col), na.rm = TRUE)),
+                   df_chr, nms)
+  fmt_row <- function(vals) paste(mapply(formatC, vals, width = widths, flag = "-"),
+                                  collapse = "  ")
+  c(fmt_row(nms),
+    paste(vapply(widths, function(w) paste(rep("-", w), collapse = ""), character(1)),
+          collapse = "  "),
+    apply(df_chr, 1, fmt_row))
+}
+
+build_cleaning_report_text <- function(rv) {
+  if (is.null(rv$data_raw)) return("No data loaded.")
+
+  n_raw  <- nrow(rv$data_raw)
+  n_inds <- dplyr::n_distinct(rv$data_raw$name)
+  fr     <- if (!is.null(rv$flagged_removals)) nrow(rv$flagged_removals) else 0
+  mr     <- if (!is.null(rv$manual_removals))  nrow(rv$manual_removals)  else 0
+  n_clean <- n_raw - fr - mr
+  study   <- rv$study_area %||% "Unknown"
+
+  div <- paste(rep("=", 54), collapse = "")
+
+  out <- c(
+    "ELEPHANT TRACKING DATA CLEANING REPORT",
+    paste0("Study area : ", study),
+    paste0("Generated  : ", format(Sys.time(), "%Y-%m-%d %H:%M")),
+    "",
+    div, "OVERVIEW", div,
+    paste0("Individuals        : ", n_inds),
+    paste0("Raw fixes loaded   : ", formatC(n_raw,   format="d", big.mark=",")),
+    paste0("Flag removals      : ", formatC(fr,       format="d", big.mark=",")),
+    paste0("Manual removals    : ", formatC(mr,       format="d", big.mark=",")),
+    paste0("Clean fixes        : ", formatC(n_clean,  format="d", big.mark=",")),
+    ""
+  )
+
+  ind_sum <- build_individual_summary(rv)
+  if (!is.null(ind_sum)) {
+    out <- c(out, div, "PER-INDIVIDUAL SUMMARY", div, .fmt_tbl(ind_sum), "")
+  }
+
+  if (fr > 0 && !is.null(rv$flagged_removals)) {
+    by_type <- rv$flagged_removals %>%
+      dplyr::count(flag_type, name = "Removed") %>%
+      dplyr::arrange(dplyr::desc(Removed)) %>%
+      dplyr::rename(`Flag Type` = flag_type)
+    by_ind <- rv$flagged_removals %>%
+      dplyr::count(name, name = "Removed") %>%
+      dplyr::arrange(dplyr::desc(Removed)) %>%
+      dplyr::rename(Individual = name)
+    out <- c(out,
+      div, paste0("FLAG REMOVALS (", formatC(fr, format="d", big.mark=","), " total)"), div,
+      "By flag type:", .fmt_tbl(by_type), "",
+      "By individual:", .fmt_tbl(by_ind), "")
+  }
+
+  if (mr > 0 && !is.null(rv$manual_removals)) {
+    by_ind <- rv$manual_removals %>%
+      dplyr::count(name, name = "Removed") %>%
+      dplyr::arrange(dplyr::desc(Removed)) %>%
+      dplyr::rename(Individual = name)
+    out <- c(out,
+      div, paste0("MANUAL REMOVALS (", formatC(mr, format="d", big.mark=","), " total)"), div,
+      .fmt_tbl(by_ind), "")
+  }
+
+  clean_dat <- build_clean_data(rv)
+  if (!is.null(clean_dat) && nrow(clean_dat) > 0) {
+    clean_by_ind <- clean_dat %>%
+      sf::st_drop_geometry() %>%
+      dplyr::group_by(name) %>%
+      dplyr::summarise(
+        `Clean Fixes` = dplyr::n(),
+        From          = format(min(timestamp_corrected, na.rm = TRUE), "%Y-%m-%d"),
+        To            = format(max(timestamp_corrected, na.rm = TRUE), "%Y-%m-%d"),
+        .groups       = "drop"
+      ) %>%
+      dplyr::rename(Individual = name)
+    out <- c(out,
+      div,
+      paste0("FINAL CLEAN DATASET (", formatC(nrow(clean_dat), format="d", big.mark=","), " fixes)"),
+      div,
+      .fmt_tbl(clean_by_ind), "")
+  }
+
+  paste(out, collapse = "\n")
+}

@@ -1,5 +1,6 @@
 mod_clean_ui <- function(id) {
   ns <- NS(id)
+  tagList(
   layout_columns(
     col_widths = c(3, 9),
 
@@ -33,7 +34,12 @@ mod_clean_ui <- function(id) {
       card_header("Individual track (post-flag removals)"),
       leafletOutput(ns("map"), height = "600px")
     )
+  ),
+  card(
+    card_header("Removal summary by individual"),
+    DTOutput(ns("ind_removal_tbl"))
   )
+  ) # close tagList
 }
 
 mod_clean_server <- function(id, rv, parent_session) {
@@ -148,6 +154,22 @@ mod_clean_server <- function(id, rv, parent_session) {
       proxy <- leafletProxy(session$ns("map"), session) %>%
         clearShapes() %>%
         clearMarkers()
+
+      # Draw HQ buffer for reference if one was set during flagging
+      if (!is.null(rv$hq_point)) {
+        proxy <- proxy %>%
+          addCircles(
+            lng         = rv$hq_point$lon,
+            lat         = rv$hq_point$lat,
+            radius      = rv$hq_point$radius_m,
+            color       = "#e67e22",
+            fillColor   = "#e67e22",
+            fillOpacity = 0.08,
+            stroke      = TRUE,
+            weight      = 1.5,
+            dashArray   = "6,4"
+          )
+      }
 
       if (nrow(d_pts) >= 2) {
         track_line <- sf::st_sfc(
@@ -341,6 +363,12 @@ mod_clean_server <- function(id, rv, parent_session) {
       tags$p(class = "text-muted", style = "font-size:0.85rem",
              n, " manual removal(s) total")
     })
+
+    output$ind_removal_tbl <- renderDT({
+      req(rv$data_raw)
+      build_individual_summary(rv)
+    }, options = list(dom = "t", paging = FALSE, scrollX = TRUE),
+       rownames = FALSE, class = "compact cell-border stripe")
 
     # ── Complete clean ─────────────────────────────────────────────────────
     observeEvent(input$complete, {

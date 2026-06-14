@@ -134,7 +134,10 @@ mod_flag_ui <- function(id) {
         card_header("Flag Summary"),
         uiOutput(ns("flag_counts")),
         hr(),
-        DTOutput(ns("flag_table"))
+        DTOutput(ns("flag_table")),
+        hr(),
+        h6("Per-individual breakdown"),
+        DTOutput(ns("ind_flag_tbl"))
       )
     )
   ) # close layout_columns
@@ -334,6 +337,7 @@ mod_flag_server <- function(id, rv, parent_session) {
         setProgress(0.05, detail = "Spatial filters")
         if (!is.null(rv$hq_point)) {
           dat <- flag_hq(dat, rv$hq_point$lon, rv$hq_point$lat, input$hq_radius_m)
+          rv$hq_point$radius_m <- input$hq_radius_m
         } else {
           dat$hq_flag <- FALSE
         }
@@ -430,6 +434,9 @@ mod_flag_server <- function(id, rv, parent_session) {
           sf::st_drop_geometry() %>%
           dplyr::filter(flag_type %in% c("outside_bbox", "hq")) %>%
           dplyr::select(name, timestamp_corrected, lon, lat, flag_type)
+        message("Auto-remove spatial: ", nrow(auto_rm), " fix(es) (",
+                sum(auto_rm$flag_type == "hq"), " hq, ",
+                sum(auto_rm$flag_type == "outside_bbox"), " outside_bbox)")
         if (nrow(auto_rm) > 0) {
           existing <- rv$flagged_removals
           rv$flagged_removals <- if (is.null(existing)) auto_rm else {
@@ -438,6 +445,9 @@ mod_flag_server <- function(id, rv, parent_session) {
           }
           out <- out %>% dplyr::filter(!flag_type %in% c("outside_bbox", "hq"))
         }
+        message("data_flagged rows after spatial auto-remove: ", nrow(out),
+                " (hq_flag still TRUE in flagged: ",
+                sum(out$hq_flag, na.rm = TRUE), ")")
         rv$data_flagged <- out
 
         showNotification("Flagging complete.", type = "message")
@@ -482,6 +492,11 @@ mod_flag_server <- function(id, rv, parent_session) {
     output$flag_table <- renderDT({
       flag_summary()
     }, options = list(dom = "t", pageLength = 10), rownames = FALSE)
+
+    output$ind_flag_tbl <- renderDT({
+      build_ind_flag_breakdown(rv)
+    }, options = list(dom = "t", paging = FALSE, scrollX = TRUE),
+       rownames = FALSE, class = "compact cell-border stripe")
 
     # ── Clear flagging ─────────────────────────────────────────────────────
     observeEvent(input$clear, {

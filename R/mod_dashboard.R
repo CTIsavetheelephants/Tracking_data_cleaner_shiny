@@ -105,50 +105,41 @@ mod_dashboard_server <- function(id, rv) {
           n_fixes = dplyr::n(),
           .groups = "drop"
         ) %>%
-        dplyr::arrange(start)
-
-      n_inds <- nrow(d)
-      h_px   <- max(400, n_inds * 28)
-
-      fig <- plotly::plot_ly()
-      for (i in seq_len(nrow(d))) {
-        fig <- fig %>%
-          plotly::add_segments(
-            x    = d$start[i], xend = d$end[i],
-            y    = d$name[i],  yend = d$name[i],
-            line = list(width = 10),
-            name = d$name[i],
-            hovertemplate = paste0(
-              "<b>", d$name[i], "</b><br>",
-              format(d$start[i], "%Y-%m-%d"), " to ",
-              format(d$end[i],   "%Y-%m-%d"), "<br>",
-              format(d$n_fixes[i], big.mark = ","), " fixes<extra></extra>"
-            )
+        dplyr::arrange(start) %>%
+        dplyr::filter(is.finite(as.numeric(start)), is.finite(as.numeric(end)), start <= end) %>%
+        dplyr::mutate(
+          name  = factor(name, levels = rev(name)),
+          label = paste0(
+            name, "\n",
+            format(start, "%Y-%m-%d"), " to ", format(end, "%Y-%m-%d"),
+            "\n", format(n_fixes, big.mark = ","), " fixes"
           )
-      }
-      fig %>%
+        )
+
+      validate(need(nrow(d) > 0, "No tracking data available."))
+
+      p <- ggplot2::ggplot(d, ggplot2::aes(
+            x = start, xend = end,
+            y = name,  yend = name,
+            text = label
+          )) +
+        ggplot2::geom_segment(linewidth = 6, colour = "#3b82f6") +
+        ggplot2::scale_x_datetime(date_labels = "%Y-%m", expand = ggplot2::expansion(mult = 0.02)) +
+        ggplot2::labs(x = NULL, y = NULL) +
+        ggplot2::theme_minimal(base_size = 11) +
+        ggplot2::theme(
+          panel.grid.major.y = ggplot2::element_line(colour = "#e0e0e0"),
+          panel.grid.minor   = ggplot2::element_blank(),
+          axis.line          = ggplot2::element_line(colour = "#444444", linewidth = 0.4),
+          axis.text.y        = ggplot2::element_text(size = 9),
+          axis.text.x        = ggplot2::element_text(size = 9)
+        )
+
+      plotly::ggplotly(p, tooltip = "text") %>%
         plotly::layout(
-          height     = h_px,
-          xaxis      = list(
-            title     = "",
-            showline  = TRUE,
-            linecolor = "#444444",
-            linewidth = 1,
-            showgrid  = FALSE
-          ),
-          yaxis      = list(
-            title      = "",
-            autorange  = FALSE,
-            range      = c(n_inds - 0.5, -0.5),
-            showgrid   = TRUE,
-            gridcolor  = "#e0e0e0",
-            gridwidth  = 1,
-            showline   = TRUE,
-            linecolor  = "#444444",
-            linewidth  = 1
-          ),
+          height     = max(400, nrow(d) * 28),
           showlegend = FALSE,
-          margin     = list(l = 120, t = 20)
+          margin     = list(l = 10, t = 20)
         )
     })
 
