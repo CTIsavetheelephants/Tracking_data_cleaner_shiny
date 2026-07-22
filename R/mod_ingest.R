@@ -449,6 +449,11 @@ mod_ingest_server <- function(id, rv, parent_session) {
           prepped_row_counts <- integer(length(file_paths))
 
           prepped_list <- lapply(seq_along(file_paths), function(i) {
+            setProgress(
+              value   = (i - 1) / length(file_paths),
+              message = sprintf("Preparing file %d of %d…", i, length(file_paths)),
+              detail  = file_names[i]
+            )
             samp       <- if (i <= length(samps)) samps[[i]] else NULL
             has_sp_col <- !is.null(samp) && "species" %in% tolower(names(samp))
 
@@ -461,33 +466,6 @@ mod_ingest_server <- function(id, rv, parent_session) {
 
             fcol <- trimws(input[[paste0("filter_col_", i)]] %||% "")
             fval <- trimws(input[[paste0("filter_val_", i)]] %||% "")
-
-            # ── Capture actual row count from the full file ─────────────────
-            raw_row_counts[[i]] <<- tryCatch({
-              d <- readr::read_csv(
-                file_paths[i],
-                col_select     = 1,
-                col_types      = readr::cols(.default = readr::col_character()),
-                locale         = readr::locale(encoding = "latin1"),
-                show_col_types = FALSE
-              )
-              if (nzchar(fcol) && nzchar(fval)) {
-                samp_i <- if (i <= length(samps)) samps[[i]] else NULL
-                if (!is.null(samp_i) && fcol %in% names(samp_i)) {
-                  # read full file with filter column to get accurate filtered count
-                  d2 <- tryCatch(readr::read_csv(
-                    file_paths[i],
-                    col_select     = dplyr::all_of(fcol),
-                    col_types      = readr::cols(.default = readr::col_character()),
-                    locale         = readr::locale(encoding = "latin1"),
-                    show_col_types = FALSE
-                  ), error = function(e) NULL)
-                  if (!is.null(d2))
-                    return(sum(as.character(d2[[fcol]]) == fval, na.rm = TRUE))
-                }
-              }
-              nrow(d)
-            }, error = function(e) NA_integer_)
 
             tryCatch({
               prepped <- prep_elephant_csv(
@@ -523,6 +501,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
                   dplyr::mutate(name = dplyr::coalesce(canonical, name)) %>%
                   dplyr::select(-canonical)
               }
+              raw_row_counts[[i]]    <<- attr(prepped, "raw_nrow") %||% NA_integer_
               prepped_row_counts[[i]] <<- if (!is.null(prepped)) nrow(prepped) else 0L
               prepped
             },
@@ -540,6 +519,8 @@ mod_ingest_server <- function(id, rv, parent_session) {
             return()
           }
 
+          setProgress(value = 0.95, message = "Combining files…",
+                      detail = "cross-file deduplication")
           dat <- combine_prepped(prepped_list)
 
           ingest_file_summary(

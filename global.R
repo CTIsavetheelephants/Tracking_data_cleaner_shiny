@@ -1,6 +1,6 @@
 library(shiny)
 
-options(shiny.maxRequestSize = 2000 * 1024^2)  # 2 GB
+options(shiny.maxRequestSize = 5000 * 1024^2)  # 2 GB
 library(bslib)
 library(bsicons)
 library(dplyr)

@@ -140,26 +140,40 @@ prep_elephant_csv <- function(file,
 
   message("Processing: ", basename(file))
 
-  # Read header to detect and skip accelerometer column (quoted arrays with
-  # embedded commas are memory-heavy at scale; colClasses="NULL" skips cleanly)
+  # Read header to detect accelerometer columns (memory-heavy quoted arrays).
+  # Use readr for speed on large files; fall back to base R on encoding errors.
   .header_names <- tryCatch(
-    names(read.csv(file, nrows = 0, check.names = FALSE, stringsAsFactors = FALSE,
-                   fileEncoding = "latin1")),
+    names(readr::read_csv(file, n_max = 0, show_col_types = FALSE,
+                          locale = readr::locale(encoding = "latin1"))),
     error = function(e)
       names(read.csv(file, nrows = 0, check.names = FALSE, stringsAsFactors = FALSE))
   )
-  .accel_cols  <- .header_names[grepl("accelero", .header_names, ignore.case = TRUE)]
-  .col_classes <- setNames(rep(NA_character_, length(.header_names)), .header_names)
-  .col_classes[.accel_cols] <- "NULL"
+  .accel_cols <- .header_names[grepl("accelero", .header_names, ignore.case = TRUE)]
+
+  # Build col_types: all character, accelerometer columns skipped entirely.
+  .ct <- readr::cols(.default = readr::col_character())
+  if (length(.accel_cols) > 0) {
+    for (.ac in .accel_cols) {
+      .ct$cols[[.ac]] <- readr::col_skip()
+    }
+  }
 
   dat <- tryCatch(
-    read.csv(file, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE,
-             colClasses = .col_classes, fileEncoding = "latin1"),
+    as.data.frame(readr::read_csv(
+      file,
+      col_types      = .ct,
+      locale         = readr::locale(encoding = "latin1"),
+      show_col_types = FALSE
+    )),
     error = function(e)
-      read.csv(file, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE,
-               colClasses = .col_classes)
+      as.data.frame(readr::read_csv(
+        file,
+        col_types      = .ct,
+        show_col_types = FALSE
+      ))
   )
   dat <- dat[, !is.na(names(dat)) & nzchar(trimws(names(dat))), drop = FALSE]
+  .raw_nrow <- nrow(dat)
 
   # Optional pre-filters: e.g. region == "Zakouma", species == "elephant"
   .apply_prefilter <- function(d, col, val) {
@@ -182,6 +196,7 @@ prep_elephant_csv <- function(file,
   dat <- rename_ci(dat, "Name",                        "name")
   dat <- rename_ci(dat, "individual-local-identifier", "name")
   dat <- rename_ci(dat, "ID_Number",                   "name")
+  dat <- rename_ci(dat, "extra__subject__name",        "name")
   if (!any(tolower(names(dat)) %in% "name")) dat <- rename_ci(dat, "id", "name")
   dat <- rename_ci(dat, "Tag",                  "tag")
   dat <- rename_ci(dat, "Time_Stamp",           "fixtime")
@@ -268,6 +283,23 @@ prep_elephant_csv <- function(file,
     return(NULL)
   }
 
+  # Fast exact-string dedup on name + raw timestamp before any expensive
+  # parsing or sf creation. Removes re-exported overlapping rows in O(n).
+  if ("name" %in% names(dat_ele)) {
+    .ft_col   <- pick_col(names(dat_ele), c("fixtime", "date.time", "datetime"))
+    if (!is.na(.ft_col)) {
+      .dedup_key <- paste(dat_ele$name,
+                          as.character(dat_ele[[.ft_col]]),
+                          sep = "|||")
+      .n_before  <- nrow(dat_ele)
+      dat_ele    <- dat_ele[!duplicated(.dedup_key), , drop = FALSE]
+      .n_removed <- .n_before - nrow(dat_ele)
+      if (.n_removed > 0)
+        message("Exact-duplicate dedup: ", .n_removed,
+                " row(s) removed from ", basename(file))
+    }
+  }
+
   # Sex
   if (!("sex" %in% names(dat_ele))) dat_ele$sex <- NA_character_
   if (!is.null(default_sex))
@@ -281,9 +313,11 @@ prep_elephant_csv <- function(file,
 
   # Geometry: lat/lon takes priority over WKT
   has_wkt <- wkt_col %in% names(dat_ele)
-  lat_col <- pick_col(names(dat_ele), c("lat", "latitude", "location-lat", "Lat", "Latitude"))
+  lat_col <- pick_col(names(dat_ele), c("lat", "latitude", "location-lat", "Lat", "Latitude",
+                                         "extra__location__latitude"))
   lon_col <- pick_col(names(dat_ele), c("lon", "long", "longitude", "location-long",
-                                         "Long", "Lon", "Longitude"))
+                                         "Long", "Lon", "Longitude",
+                                         "extra__location__longitude"))
 
   if (!is.na(lat_col) && !is.na(lon_col)) {
     dat_ele2 <- dat_ele %>%
@@ -440,8 +474,10 @@ prep_elephant_csv <- function(file,
       tz = "UTC", train = FALSE)
   )
 
-  # Timezone from coordinates
-  tz_vec  <- get_tz_for_points(dat_sf$lon, dat_sf$lat)
+  # Timezone from a sample of coordinates (majority vote; all points in one
+  # study area share a timezone so sampling 500 is sufficient).
+  .tz_idx <- if (nrow(dat_sf) > 500) sample.int(nrow(dat_sf), 500) else seq_len(nrow(dat_sf))
+  tz_vec  <- get_tz_for_points(dat_sf$lon[.tz_idx], dat_sf$lat[.tz_idx])
   tz_tab  <- table(tz_vec, useNA = "no")
   tz_mode <- if (length(tz_tab) > 0) names(tz_tab)[which.max(tz_tab)] else "UTC"
   if (is.na(tz_mode) || !nzchar(tz_mode)) tz_mode <- "UTC"
@@ -456,7 +492,7 @@ prep_elephant_csv <- function(file,
   else
     lubridate::force_tz(ts_utc,  tzone = tz_mode)
 
-  dat_sf %>%
+  out <- dat_sf %>%
     dplyr::mutate(
       timestamp_corrected = ts_corrected,
       tz    = tz_mode,
@@ -464,14 +500,16 @@ prep_elephant_csv <- function(file,
       day   = lubridate::day(timestamp_corrected)
     ) %>%
     dplyr::filter(!is.na(timestamp_corrected)) %>%
+    .dedup_consecutive("name", "timestamp_corrected", min_gap_mins = 5) %>%
     to_utm(.) %>%
     dplyr::mutate(
       x = sf::st_coordinates(.)[, 1],
       y = sf::st_coordinates(.)[, 2]
     ) %>%
     { if (earthranger) .split_earthranger_collars(.) else . } %>%
-    .dedup_consecutive("name", "timestamp_corrected", min_gap_mins = 5) %>%
     dplyr::arrange(name, timestamp_corrected)
+  attr(out, "raw_nrow") <- .raw_nrow
+  out
 }
 
 # ---------------------------------------------------------------------------
@@ -586,9 +624,7 @@ prep_elephant_csv <- function(file,
 
 combine_prepped <- function(prepped_list) {
   # Compute the globally-optimal UTM zone from the WGS84 lon/lat columns
-  # stored in every file.  Doing this before binding means each file is
-  # reprojected exactly once to the shared zone and x/y recomputed in the
-  # same pass — no intermediate alignment step needed.
+  # stored in every file.
   all_lon     <- unlist(lapply(prepped_list, `[[`, "lon"))
   all_lat     <- unlist(lapply(prepped_list, `[[`, "lat"))
   mean_lon    <- mean(all_lon, na.rm = TRUE)
@@ -598,11 +634,13 @@ combine_prepped <- function(prepped_list) {
 
   message("Global UTM zone: EPSG ", global_epsg)
 
+  # Reproject only files not already in the target zone; update x/y.
   prepped_aligned <- lapply(prepped_list, function(sf_obj) {
-    sf_obj        <- sf::st_transform(sf_obj, global_epsg)
-    coords        <- sf::st_coordinates(sf_obj)
-    sf_obj$x      <- coords[, 1]
-    sf_obj$y      <- coords[, 2]
+    if (isTRUE(sf::st_crs(sf_obj)$epsg == global_epsg)) return(sf_obj)
+    sf_obj   <- sf::st_transform(sf_obj, global_epsg)
+    coords   <- sf::st_coordinates(sf_obj)
+    sf_obj$x <- coords[, 1]
+    sf_obj$y <- coords[, 2]
     sf_obj
   })
 
