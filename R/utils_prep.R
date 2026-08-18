@@ -46,6 +46,56 @@ get_tz_for_points <- function(lon, lat, drc_east_tz = "Africa/Lubumbashi") {
 }
 
 # ---------------------------------------------------------------------------
+# File reading — CSV or Excel (.xls / .xlsx)
+# ---------------------------------------------------------------------------
+# Shiny's fileInput stores uploads under a temp path that does NOT preserve the
+# original extension, so we detect the format from the file's magic bytes rather
+# than its name.  xlsx = ZIP (PK..), xls = OLE2 compound document.
+excel_type <- function(path) {
+  sig <- tryCatch({
+    con <- file(path, "rb"); on.exit(close(con))
+    readBin(con, "raw", n = 8L)
+  }, error = function(e) raw(0))
+  if (length(sig) >= 4 &&
+      identical(sig[1:4], as.raw(c(0x50, 0x4B, 0x03, 0x04)))) return("xlsx")
+  if (length(sig) >= 8 &&
+      identical(sig[1:8], as.raw(c(0xD0, 0xCF, 0x11, 0xE0,
+                                   0xA1, 0xB1, 0x1A, 0xE1)))) return("xls")
+  NA_character_
+}
+
+# Coerce any column to character so Excel input behaves exactly like the
+# all-character data frames produced by read_csv.  Date/time cells become ISO
+# strings that the timestamp parser understands.
+.coerce_char <- function(col) {
+  if (inherits(col, "POSIXt")) format(col, "%Y-%m-%d %H:%M:%S")
+  else if (inherits(col, "Date")) format(col, "%Y-%m-%d")
+  else as.character(col)
+}
+
+# Read a tracking file (CSV or Excel) as an all-character data.frame.
+read_tracking_any <- function(path, n_max = Inf) {
+  xt <- excel_type(path)
+  if (!is.na(xt)) {
+    reader <- if (xt == "xlsx") readxl::read_xlsx else readxl::read_xls
+    df <- reader(path,
+                 n_max        = if (is.finite(n_max)) n_max else Inf,
+                 .name_repair = "minimal")
+    df <- as.data.frame(df, stringsAsFactors = FALSE, check.names = FALSE)
+    df[] <- lapply(df, .coerce_char)
+    df
+  } else {
+    as.data.frame(readr::read_csv(
+      path,
+      col_types      = readr::cols(.default = readr::col_character()),
+      locale         = readr::locale(encoding = "latin1"),
+      show_col_types = FALSE,
+      n_max          = if (is.finite(n_max)) n_max else Inf
+    ))
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Column-name helpers (case-insensitive)
 # ---------------------------------------------------------------------------
 
@@ -62,6 +112,34 @@ rename_ci <- function(df, from, to) {
   idx <- which(tolower(nms) == tolower(from))
   if (length(idx) == 1 && !(to %in% nms)) names(df)[idx] <- to
   df
+}
+
+# Canonical column-name candidates (all lowercase; matched case-insensitively).
+# Shared by prep_elephant_csv() and the has_auto_*() detectors below so the UI's
+# "could we auto-detect this?" check stays in sync with what prep actually does.
+NAME_COL_CANDIDATES <- c("name", "individual-local-identifier", "id_number",
+                         "extra__subject__name", "id", "name.x", "name.y")
+TAG_COL_CANDIDATES  <- c("tag", "tagid", "tag_id", "tag id",
+                         "collar", "collarid", "collar_id", "collar id",
+                         "deviceid", "device_id", "device id")
+LAT_COL_CANDIDATES  <- c("lat", "latitude", "location-lat", "extra__location__latitude")
+LON_COL_CANDIDATES  <- c("lon", "long", "longitude", "location-long",
+                         "extra__location__longitude")
+XY_X_CANDIDATES     <- c("x", "easting", "utm_x", "utm.x")
+XY_Y_CANDIDATES     <- c("y", "northing", "utm_y", "utm.y")
+
+# TRUE if any column would be auto-recognised as the individual identifier.
+has_auto_name_col <- function(nms) {
+  nl <- tolower(nms)
+  any(nl %in% NAME_COL_CANDIDATES) || any(nl %in% TAG_COL_CANDIDATES)
+}
+
+# TRUE if coordinates are auto-recognisable (lat/lon pair, WKT geometry, or x/y).
+has_auto_coord_cols <- function(nms) {
+  if (!is.na(pick_col(nms, LAT_COL_CANDIDATES)) &&
+      !is.na(pick_col(nms, LON_COL_CANDIDATES))) return(TRUE)
+  if ("geometry" %in% nms) return(TRUE)
+  !is.na(pick_col(nms, XY_X_CANDIDATES)) && !is.na(pick_col(nms, XY_Y_CANDIDATES))
 }
 
 is_zero_wkt <- function(x) {
@@ -136,42 +214,56 @@ prep_elephant_csv <- function(file,
                                filter_elephant    = TRUE,
                                include_na_species = FALSE,
                                timestamps_utc     = TRUE,
-                               earthranger        = FALSE) {
+                               earthranger        = FALSE,
+                               manual_id_col      = NULL,
+                               manual_lat_col     = NULL,
+                               manual_lon_col     = NULL) {
 
   message("Processing: ", basename(file))
 
-  # Read header to detect accelerometer columns (memory-heavy quoted arrays).
-  # Use readr for speed on large files; fall back to base R on encoding errors.
-  .header_names <- tryCatch(
-    names(readr::read_csv(file, n_max = 0, show_col_types = FALSE,
-                          locale = readr::locale(encoding = "latin1"))),
-    error = function(e)
-      names(read.csv(file, nrows = 0, check.names = FALSE, stringsAsFactors = FALSE))
-  )
-  .accel_cols <- .header_names[grepl("accelero", .header_names, ignore.case = TRUE)]
+  if (!is.na(excel_type(file))) {
+    # Excel (.xls / .xlsx): read the whole sheet, then drop accelerometer
+    # columns (memory-heavy quoted arrays) to match the CSV path below.
+    dat <- read_tracking_any(file)
+    .accel_cols <- names(dat)[grepl("accelero", names(dat), ignore.case = TRUE)]
+    if (length(.accel_cols) > 0)
+      dat <- dat[, !names(dat) %in% .accel_cols, drop = FALSE]
 
-  # Build col_types: all character, accelerometer columns skipped entirely.
-  .ct <- readr::cols(.default = readr::col_character())
-  if (length(.accel_cols) > 0) {
-    for (.ac in .accel_cols) {
-      .ct$cols[[.ac]] <- readr::col_skip()
+  } else {
+    # CSV: read header first to detect accelerometer columns (memory-heavy
+    # quoted arrays) and skip them at read time.
+    # Use readr for speed on large files; fall back to base R on encoding errors.
+    .header_names <- tryCatch(
+      names(readr::read_csv(file, n_max = 0, show_col_types = FALSE,
+                            locale = readr::locale(encoding = "latin1"))),
+      error = function(e)
+        names(read.csv(file, nrows = 0, check.names = FALSE, stringsAsFactors = FALSE))
+    )
+    .accel_cols <- .header_names[grepl("accelero", .header_names, ignore.case = TRUE)]
+
+    # Build col_types: all character, accelerometer columns skipped entirely.
+    .ct <- readr::cols(.default = readr::col_character())
+    if (length(.accel_cols) > 0) {
+      for (.ac in .accel_cols) {
+        .ct$cols[[.ac]] <- readr::col_skip()
+      }
     }
-  }
 
-  dat <- tryCatch(
-    as.data.frame(readr::read_csv(
-      file,
-      col_types      = .ct,
-      locale         = readr::locale(encoding = "latin1"),
-      show_col_types = FALSE
-    )),
-    error = function(e)
+    dat <- tryCatch(
       as.data.frame(readr::read_csv(
         file,
         col_types      = .ct,
+        locale         = readr::locale(encoding = "latin1"),
         show_col_types = FALSE
-      ))
-  )
+      )),
+      error = function(e)
+        as.data.frame(readr::read_csv(
+          file,
+          col_types      = .ct,
+          show_col_types = FALSE
+        ))
+    )
+  }
   dat <- dat[, !is.na(names(dat)) & nzchar(trimws(names(dat))), drop = FALSE]
   .raw_nrow <- nrow(dat)
 
@@ -198,7 +290,12 @@ prep_elephant_csv <- function(file,
   dat <- rename_ci(dat, "ID_Number",                   "name")
   dat <- rename_ci(dat, "extra__subject__name",        "name")
   if (!any(tolower(names(dat)) %in% "name")) dat <- rename_ci(dat, "id", "name")
-  dat <- rename_ci(dat, "Tag",                  "tag")
+  # Collar / tag identifier — becomes the individual name when no explicit name
+  # column exists (e.g. Savannah Tracking exports keyed only by TagId).
+  if (!("tag" %in% tolower(names(dat)))) {
+    .tag_col <- pick_col(names(dat), TAG_COL_CANDIDATES)
+    if (!is.na(.tag_col)) names(dat)[names(dat) == .tag_col] <- "tag"
+  }
   dat <- rename_ci(dat, "Time_Stamp",           "fixtime")
   dat <- rename_ci(dat, "Time_stamp",           "fixtime")
   dat <- rename_ci(dat, "Time Stamp",           "fixtime")
@@ -222,6 +319,15 @@ prep_elephant_csv <- function(file,
   if (!("name" %in% names(dat))) {
     nm_x <- pick_col(names(dat), c("name.x", "name.y"))
     if (!is.na(nm_x)) names(dat)[tolower(names(dat)) == tolower(nm_x)] <- "name"
+  }
+  # Manual override: user-selected ID column (only used when nothing above matched)
+  if (!("name" %in% names(dat)) &&
+      !is.null(manual_id_col) && nzchar(trimws(manual_id_col))) {
+    hit <- which(tolower(names(dat)) == tolower(trimws(manual_id_col)))
+    if (length(hit) == 1) {
+      names(dat)[hit] <- "name"
+      message("Using user-selected ID column '", manual_id_col, "' as individual name")
+    }
   }
   if ("name" %in% names(dat)) {
     dat$name <- trimws(as.character(dat$name))
@@ -313,11 +419,21 @@ prep_elephant_csv <- function(file,
 
   # Geometry: lat/lon takes priority over WKT
   has_wkt <- wkt_col %in% names(dat_ele)
-  lat_col <- pick_col(names(dat_ele), c("lat", "latitude", "location-lat", "Lat", "Latitude",
-                                         "extra__location__latitude"))
-  lon_col <- pick_col(names(dat_ele), c("lon", "long", "longitude", "location-long",
-                                         "Long", "Lon", "Longitude",
-                                         "extra__location__longitude"))
+  lat_col <- pick_col(names(dat_ele), LAT_COL_CANDIDATES)
+  lon_col <- pick_col(names(dat_ele), LON_COL_CANDIDATES)
+
+  # Manual override: user-selected lat/lon columns (only when auto-detection failed)
+  if (is.na(lat_col) && !is.null(manual_lat_col) && nzchar(trimws(manual_lat_col))) {
+    hit <- which(tolower(names(dat_ele)) == tolower(trimws(manual_lat_col)))
+    if (length(hit) == 1) lat_col <- names(dat_ele)[hit]
+  }
+  if (is.na(lon_col) && !is.null(manual_lon_col) && nzchar(trimws(manual_lon_col))) {
+    hit <- which(tolower(names(dat_ele)) == tolower(trimws(manual_lon_col)))
+    if (length(hit) == 1) lon_col <- names(dat_ele)[hit]
+  }
+  if (!is.na(lat_col) && !is.na(lon_col) &&
+      (!is.null(manual_lat_col) && nzchar(trimws(manual_lat_col))))
+    message("Using user-selected coordinate columns '", lat_col, "' / '", lon_col, "'")
 
   if (!is.na(lat_col) && !is.na(lon_col)) {
     dat_ele2 <- dat_ele %>%
@@ -350,8 +466,8 @@ prep_elephant_csv <- function(file,
     rm(dat_ele); gc()
   } else {
     # Third fallback: projected x/y (UTM easting/northing)
-    x_col <- pick_col(names(dat_ele), c("x", "easting", "utm_x", "utm.x"))
-    y_col <- pick_col(names(dat_ele), c("y", "northing", "utm_y", "utm.y"))
+    x_col <- pick_col(names(dat_ele), XY_X_CANDIDATES)
+    y_col <- pick_col(names(dat_ele), XY_Y_CANDIDATES)
 
     if (!is.na(x_col) && !is.na(y_col)) {
       dat_ele2 <- dat_ele %>%

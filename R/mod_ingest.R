@@ -102,8 +102,9 @@ mod_ingest_ui <- function(id) {
         });
       ")),
       div(class = "ingest-left",
-      fileInput(ns("files"), "Upload raw CSV file(s)",
-                multiple = TRUE, accept = ".csv"),
+      fileInput(ns("files"), "Upload raw CSV or Excel file(s)",
+                multiple = TRUE,
+                accept   = c(".csv", ".xls", ".xlsx")),
       uiOutput(ns("per_file_ui")),
       hr(),
       textInput(ns("study_area"), "Study area name", placeholder = "e.g. Garamba National Park"),
@@ -116,7 +117,7 @@ mod_ingest_ui <- function(id) {
                "Example: 32734 = WGS84 / UTM Zone 34S."),
       hr(),
       h6("Name corrections from CSV (optional)"),
-      helpText("Upload a two-column CSV mapping raw collar / data names to canonical",
+      helpText("Upload a two-column CSV or Excel file mapping raw collar / data names to canonical",
                "elephant names. Applied to each file before they are combined,",
                "so the rolling deduplication correctly treats renamed animals as one."),
       actionButton(ns("open_corr_modal"), "Browse corrections CSV…",
@@ -207,13 +208,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
                       detail = paste0("File ", i, " of ", n_files,
                                       ": ", input$files$name[i]))
           samps[[i]] <- tryCatch(
-            readr::read_csv(
-              input$files$datapath[i],
-              col_types      = readr::cols(.default = readr::col_character()),
-              locale         = readr::locale(encoding = "latin1"),
-              show_col_types = FALSE,
-              n_max          = 100000
-            ),
+            read_tracking_any(input$files$datapath[i], n_max = 100000),
             error = function(e) NULL
           )
         }
@@ -341,6 +336,58 @@ mod_ingest_server <- function(id, rv, parent_session) {
               )
             },
 
+            # ── Manual column mapping (shown only when auto-detection fails) ──
+            if (!still_load && length(all_cols) > 0 &&
+                (!has_auto_name_col(all_cols) || !has_auto_coord_cols(all_cols))) {
+              need_id    <- !has_auto_name_col(all_cols)
+              need_coord <- !has_auto_coord_cols(all_cols)
+              tagList(
+                tags$hr(style = "margin:0.5rem 0;"),
+                tags$p(
+                  style = "font-weight:600; font-size:0.78rem; color:#b9770e; margin-bottom:0.4rem;",
+                  "⚠ Could not auto-detect ",
+                  if (need_id && need_coord) "the ID and coordinate columns"
+                  else if (need_id)          "an ID column"
+                  else                        "coordinate columns",
+                  " — please select ", if (need_id && need_coord) "them" else "manually below."
+                ),
+                if (need_id)
+                  selectizeInput(
+                    session$ns(paste0("id_col_", i)),
+                    "ID / individual column",
+                    choices  = c("--- select ---" = "", all_cols),
+                    selected = "",
+                    width    = "100%",
+                    options  = list(placeholder = "--- select ---", maxOptions = 300)
+                  ),
+                if (need_coord)
+                  div(
+                    class = "prefilter-pair",
+                    style = "display:flex; gap:0.5rem; align-items:flex-start;",
+                    div(style = "flex:1; min-width:0;",
+                      selectizeInput(
+                        session$ns(paste0("lat_col_", i)),
+                        "Latitude column",
+                        choices  = c("--- select ---" = "", all_cols),
+                        selected = "",
+                        width    = "100%",
+                        options  = list(placeholder = "--- select ---", maxOptions = 300)
+                      )
+                    ),
+                    div(style = "flex:1; min-width:0;",
+                      selectizeInput(
+                        session$ns(paste0("lon_col_", i)),
+                        "Longitude column",
+                        choices  = c("--- select ---" = "", all_cols),
+                        selected = "",
+                        width    = "100%",
+                        options  = list(placeholder = "--- select ---", maxOptions = 300)
+                      )
+                    )
+                  )
+              )
+            },
+
             # ── Pre-filter ───────────────────────────────────────────────
             if (length(all_cols) > 0) {
               tagList(
@@ -412,7 +459,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
       missing <- character(0)
 
       if (is.null(input$files))
-        missing <- c(missing, "Upload at least one CSV file")
+        missing <- c(missing, "Upload at least one CSV or Excel file")
 
       if (!nzchar(trimws(input$study_area %||% "")))
         missing <- c(missing, "Enter a study area name")
@@ -425,6 +472,23 @@ mod_ingest_server <- function(id, rv, parent_session) {
             paste0("File ‘", input$files$name[i],
                    "’: no species column detected — ",
                    "tick ‘All rows are elephant’ to proceed"))
+        }
+        # Manual column mapping required when auto-detection failed
+        cols_i <- if (!is.null(samp)) names(samp) else character(0)
+        if (length(cols_i) > 0) {
+          if (!has_auto_name_col(cols_i) &&
+              !nzchar(trimws(input[[paste0("id_col_", i)]] %||% ""))) {
+            missing <- c(missing,
+              paste0("File ‘", input$files$name[i],
+                     "’: select an ID / individual column"))
+          }
+          if (!has_auto_coord_cols(cols_i) &&
+              (!nzchar(trimws(input[[paste0("lat_col_", i)]] %||% "")) ||
+               !nzchar(trimws(input[[paste0("lon_col_", i)]] %||% "")))) {
+            missing <- c(missing,
+              paste0("File ‘", input$files$name[i],
+                     "’: select latitude and longitude columns"))
+          }
         }
       }
 
@@ -467,6 +531,10 @@ mod_ingest_server <- function(id, rv, parent_session) {
             fcol <- trimws(input[[paste0("filter_col_", i)]] %||% "")
             fval <- trimws(input[[paste0("filter_val_", i)]] %||% "")
 
+            id_sel  <- trimws(input[[paste0("id_col_",  i)]] %||% "")
+            lat_sel <- trimws(input[[paste0("lat_col_", i)]] %||% "")
+            lon_sel <- trimws(input[[paste0("lon_col_", i)]] %||% "")
+
             tryCatch({
               prepped <- prep_elephant_csv(
                 file_paths[i],
@@ -478,7 +546,10 @@ mod_ingest_server <- function(id, rv, parent_session) {
                 filter_elephant    = filter_elephant,
                 include_na_species = include_na_species,
                 timestamps_utc     = isTRUE(input[[paste0("timestamps_utc_", i)]]),
-                earthranger        = isTRUE(input[[paste0("earthranger_", i)]])
+                earthranger        = isTRUE(input[[paste0("earthranger_", i)]]),
+                manual_id_col      = if (nzchar(id_sel))  id_sel  else NULL,
+                manual_lat_col     = if (nzchar(lat_sel)) lat_sel else NULL,
+                manual_lon_col     = if (nzchar(lon_sel)) lon_sel else NULL
               )
               # Apply name corrections per-file so that combine_prepped sees
               # canonical names and its rolling 5-minute dedup correctly merges
@@ -759,7 +830,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
         helpText("Two-column CSV: one column with the name as it appears in",
                  "the data, one column with the correct canonical name."),
         fileInput(session$ns("name_corr_file"), NULL,
-                  accept      = ".csv",
+                  accept      = c(".csv", ".xls", ".xlsx"),
                   buttonLabel = "Browse…",
                   placeholder = "No file selected"),
         easyClose = TRUE,
@@ -771,11 +842,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
     observeEvent(input$name_corr_file, {
       req(input$name_corr_file)
       d <- tryCatch(
-        readr::read_csv(
-          input$name_corr_file$datapath,
-          col_types      = readr::cols(.default = readr::col_character()),
-          show_col_types = FALSE
-        ),
+        read_tracking_any(input$name_corr_file$datapath),
         error = function(e) {
           showNotification(paste0("Could not read corrections file: ",
                                   conditionMessage(e)),
