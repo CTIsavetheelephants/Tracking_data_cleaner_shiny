@@ -338,18 +338,21 @@ mod_ingest_server <- function(id, rv, parent_session) {
 
             # ── Manual column mapping (shown only when auto-detection fails) ──
             if (!still_load && length(all_cols) > 0 &&
-                (!has_auto_name_col(all_cols) || !has_auto_coord_cols(all_cols))) {
+                (!has_auto_name_col(all_cols) || !has_auto_coord_cols(all_cols) ||
+                 !has_auto_timestamp_cols(all_cols))) {
               need_id    <- !has_auto_name_col(all_cols)
               need_coord <- !has_auto_coord_cols(all_cols)
+              need_ts    <- !has_auto_timestamp_cols(all_cols)
+              needs <- c(if (need_id) "an ID column",
+                         if (need_coord) "coordinate columns",
+                         if (need_ts) "date & time columns")
               tagList(
                 tags$hr(style = "margin:0.5rem 0;"),
                 tags$p(
                   style = "font-weight:600; font-size:0.78rem; color:#b9770e; margin-bottom:0.4rem;",
-                  "⚠ Could not auto-detect ",
-                  if (need_id && need_coord) "the ID and coordinate columns"
-                  else if (need_id)          "an ID column"
-                  else                        "coordinate columns",
-                  " — please select ", if (need_id && need_coord) "them" else "manually below."
+                  paste0("⚠ Could not auto-detect ",
+                         paste(needs, collapse = ", "),
+                         " — please select below.")
                 ),
                 if (need_id)
                   selectizeInput(
@@ -384,6 +387,36 @@ mod_ingest_server <- function(id, rv, parent_session) {
                         options  = list(placeholder = "--- select ---", maxOptions = 300)
                       )
                     )
+                  ),
+                if (need_ts)
+                  tagList(
+                    div(
+                      class = "prefilter-pair",
+                      style = "display:flex; gap:0.5rem; align-items:flex-start;",
+                      div(style = "flex:1; min-width:0;",
+                        selectizeInput(
+                          session$ns(paste0("date_col_", i)),
+                          "Date column",
+                          choices  = c("--- select ---" = "", all_cols),
+                          selected = "",
+                          width    = "100%",
+                          options  = list(placeholder = "--- select ---", maxOptions = 300)
+                        )
+                      ),
+                      div(style = "flex:1; min-width:0;",
+                        selectizeInput(
+                          session$ns(paste0("time_col_", i)),
+                          "Time column (separate from date)",
+                          choices  = c("--- select ---" = "", all_cols),
+                          selected = "",
+                          width    = "100%",
+                          options  = list(placeholder = "--- select ---", maxOptions = 300)
+                        )
+                      )
+                    ),
+                    helpText(style = "font-size:0.72rem; margin-top:-0.2rem;",
+                             "Only for files where the date and time of each fix are in",
+                             "two separate columns.")
                   )
               )
             },
@@ -489,6 +522,13 @@ mod_ingest_server <- function(id, rv, parent_session) {
               paste0("File ‘", input$files$name[i],
                      "’: select latitude and longitude columns"))
           }
+          if (!has_auto_timestamp_cols(cols_i) &&
+              (!nzchar(trimws(input[[paste0("date_col_", i)]] %||% "")) ||
+               !nzchar(trimws(input[[paste0("time_col_", i)]] %||% "")))) {
+            missing <- c(missing,
+              paste0("File ‘", input$files$name[i],
+                     "’: select date and time columns"))
+          }
         }
       }
 
@@ -531,9 +571,11 @@ mod_ingest_server <- function(id, rv, parent_session) {
             fcol <- trimws(input[[paste0("filter_col_", i)]] %||% "")
             fval <- trimws(input[[paste0("filter_val_", i)]] %||% "")
 
-            id_sel  <- trimws(input[[paste0("id_col_",  i)]] %||% "")
-            lat_sel <- trimws(input[[paste0("lat_col_", i)]] %||% "")
-            lon_sel <- trimws(input[[paste0("lon_col_", i)]] %||% "")
+            id_sel   <- trimws(input[[paste0("id_col_",   i)]] %||% "")
+            lat_sel  <- trimws(input[[paste0("lat_col_",  i)]] %||% "")
+            lon_sel  <- trimws(input[[paste0("lon_col_",  i)]] %||% "")
+            date_sel <- trimws(input[[paste0("date_col_", i)]] %||% "")
+            time_sel <- trimws(input[[paste0("time_col_", i)]] %||% "")
 
             tryCatch({
               prepped <- prep_elephant_csv(
@@ -547,9 +589,11 @@ mod_ingest_server <- function(id, rv, parent_session) {
                 include_na_species = include_na_species,
                 timestamps_utc     = isTRUE(input[[paste0("timestamps_utc_", i)]]),
                 earthranger        = isTRUE(input[[paste0("earthranger_", i)]]),
-                manual_id_col      = if (nzchar(id_sel))  id_sel  else NULL,
-                manual_lat_col     = if (nzchar(lat_sel)) lat_sel else NULL,
-                manual_lon_col     = if (nzchar(lon_sel)) lon_sel else NULL
+                manual_id_col      = if (nzchar(id_sel))   id_sel   else NULL,
+                manual_lat_col     = if (nzchar(lat_sel))  lat_sel  else NULL,
+                manual_lon_col     = if (nzchar(lon_sel))  lon_sel  else NULL,
+                manual_date_col    = if (nzchar(date_sel)) date_sel else NULL,
+                manual_time_col    = if (nzchar(time_sel)) time_sel else NULL
               )
               # Apply name corrections per-file so that combine_prepped sees
               # canonical names and its rolling 5-minute dedup correctly merges

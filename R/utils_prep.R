@@ -127,11 +127,28 @@ LON_COL_CANDIDATES  <- c("lon", "long", "longitude", "location-long",
                          "extra__location__longitude")
 XY_X_CANDIDATES     <- c("x", "easting", "utm_x", "utm.x")
 XY_Y_CANDIDATES     <- c("y", "northing", "utm_y", "utm.y")
+# Separate date-only / time-of-day columns (combined into one timestamp when no
+# single timestamp column exists).  Covers common prefixed forms e.g. UTC_Date.
+DATE_COL_CANDIDATES <- c("date", "utc_date", "gps_date", "gmt_date", "local_date",
+                         "date_utc", "fix_date", "fixdate", "localdate")
+TIME_COL_CANDIDATES <- c("time", "utc_time", "gps_time", "gmt_time", "local_time",
+                         "time_utc", "fix_time", "localtime")
 
 # TRUE if any column would be auto-recognised as the individual identifier.
 has_auto_name_col <- function(nms) {
   nl <- tolower(nms)
   any(nl %in% NAME_COL_CANDIDATES) || any(nl %in% TAG_COL_CANDIDATES)
+}
+
+# TRUE if a timestamp is auto-recognisable — either a single combined timestamp
+# column, or a separate date column paired with a time column.
+TIMESTAMP_COL_CANDIDATES <- c("fixtime", "timestamp", "timestamp_corrected",
+                              "time_stamp", "time stamp", "date.time",
+                              "datetime", "date_time")
+has_auto_timestamp_cols <- function(nms) {
+  if (any(tolower(nms) %in% TIMESTAMP_COL_CANDIDATES)) return(TRUE)
+  !is.na(pick_col(nms, DATE_COL_CANDIDATES)) &&
+    !is.na(pick_col(nms, TIME_COL_CANDIDATES))
 }
 
 # TRUE if coordinates are auto-recognisable (lat/lon pair, WKT geometry, or x/y).
@@ -140,6 +157,37 @@ has_auto_coord_cols <- function(nms) {
       !is.na(pick_col(nms, LON_COL_CANDIDATES))) return(TRUE)
   if ("geometry" %in% nms) return(TRUE)
   !is.na(pick_col(nms, XY_X_CANDIDATES)) && !is.na(pick_col(nms, XY_Y_CANDIDATES))
+}
+
+# Choose a coordinate column from several candidates, preferring the one whose
+# values actually fall in the valid degree range.  Handles files that carry both
+# decimal degrees (Latitude/Longitude) AND projected UTM (Lat/Lon) columns — the
+# UTM pair scores zero in-range and is correctly rejected in favour of degrees.
+.pick_coord_col <- function(df, candidates, lo, hi) {
+  nms_l  <- tolower(names(df))
+  actual <- unique(names(df)[nms_l %in% tolower(candidates)])
+  if (length(actual) == 0) return(NA_character_)
+  if (length(actual) == 1) return(actual[1])
+  score <- vapply(actual, function(cn) {
+    v <- suppressWarnings(as.numeric(df[[cn]]))
+    sum(is.finite(v) & v >= lo & v <= hi)
+  }, numeric(1))
+  if (max(score) == 0) return(actual[1])  # none in range — leave to downstream filter
+  actual[which.max(score)]
+}
+
+# Combine a separate date column and time-of-day column into one timestamp
+# string.  Robust to Excel serials read as POSIXct: a date cell becomes
+# "2021-12-02 00:00:00" and a time-of-day cell "1899-12-31 06:01:15", so we keep
+# only the date part of the first and only the HH:MM(:SS) clock of the second.
+.combine_date_time <- function(date_vec, time_vec) {
+  d  <- sub("[ T].*$", "", trimws(as.character(date_vec)))       # date portion only
+  t  <- trimws(as.character(time_vec))
+  m  <- regexpr("\\d{1,2}:\\d{2}(:\\d{2})?", t)                  # HH:MM(:SS) if present
+  tt <- t
+  has <- m > 0
+  if (any(has)) tt[has] <- regmatches(t, m)
+  trimws(paste(d, tt))
 }
 
 is_zero_wkt <- function(x) {
@@ -217,7 +265,9 @@ prep_elephant_csv <- function(file,
                                earthranger        = FALSE,
                                manual_id_col      = NULL,
                                manual_lat_col     = NULL,
-                               manual_lon_col     = NULL) {
+                               manual_lon_col     = NULL,
+                               manual_date_col    = NULL,
+                               manual_time_col    = NULL) {
 
   message("Processing: ", basename(file))
 
@@ -304,11 +354,19 @@ prep_elephant_csv <- function(file,
   dat <- rename_ci(dat, "timestamp_corrected",  "fixtime")
   # Combine separate Date + Time columns when no combined timestamp column exists
   if (!"fixtime" %in% tolower(names(dat))) {
-    .date_col  <- pick_col(names(dat), "date")
-    .time_col2 <- pick_col(names(dat), "time")
+    .date_col  <- pick_col(names(dat), DATE_COL_CANDIDATES)
+    .time_col2 <- pick_col(names(dat), TIME_COL_CANDIDATES)
+    # Manual fallback: user-selected date / time columns (only when not auto-found)
+    if (is.na(.date_col) && !is.null(manual_date_col) && nzchar(trimws(manual_date_col))) {
+      hit <- which(tolower(names(dat)) == tolower(trimws(manual_date_col)))
+      if (length(hit) == 1) .date_col <- names(dat)[hit]
+    }
+    if (is.na(.time_col2) && !is.null(manual_time_col) && nzchar(trimws(manual_time_col))) {
+      hit <- which(tolower(names(dat)) == tolower(trimws(manual_time_col)))
+      if (length(hit) == 1) .time_col2 <- names(dat)[hit]
+    }
     if (!is.na(.date_col) && !is.na(.time_col2)) {
-      dat$fixtime <- paste(trimws(as.character(dat[[.date_col]])),
-                           trimws(as.character(dat[[.time_col2]])))
+      dat$fixtime <- .combine_date_time(dat[[.date_col]], dat[[.time_col2]])
       message("Combined '", .date_col, "' + '", .time_col2,
               "' columns into timestamp for ", basename(file))
     }
@@ -417,10 +475,11 @@ prep_elephant_csv <- function(file,
     TRUE                               ~ dat_ele$sex
   )
 
-  # Geometry: lat/lon takes priority over WKT
+  # Geometry: lat/lon takes priority over WKT.  Value-aware pick so that files
+  # carrying both decimal degrees and UTM under similar names choose the degrees.
   has_wkt <- wkt_col %in% names(dat_ele)
-  lat_col <- pick_col(names(dat_ele), LAT_COL_CANDIDATES)
-  lon_col <- pick_col(names(dat_ele), LON_COL_CANDIDATES)
+  lat_col <- .pick_coord_col(dat_ele, LAT_COL_CANDIDATES,  -90,  90)
+  lon_col <- .pick_coord_col(dat_ele, LON_COL_CANDIDATES, -180, 180)
 
   # Manual override: user-selected lat/lon columns (only when auto-detection failed)
   if (is.na(lat_col) && !is.null(manual_lat_col) && nzchar(trimws(manual_lat_col))) {
