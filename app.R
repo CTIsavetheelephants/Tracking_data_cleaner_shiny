@@ -11,8 +11,8 @@ ui <- page_navbar(
   nav_panel("Step 3: Flag",              mod_flag_ui("flag")),
   nav_panel("Step 4: Flag Review",       mod_review_ui("review")),
   nav_panel("Step 5: Manual Cleaning",   mod_clean_ui("clean")),
-  nav_panel("Step 6: Export",            mod_export_ui("export")),
-  nav_panel("Dashboard",               mod_dashboard_ui("dashboard")),
+  nav_panel("Step 6: Dashboard and Final Review", mod_dashboard_ui("dashboard")),
+  nav_panel("Step 7: Export",            mod_export_ui("export")),
   nav_spacer(),
   nav_item(
     actionButton("start_over", "Start over", icon = icon("rotate-left"),
@@ -60,7 +60,7 @@ server <- function(input, output, session) {
   mod_review_server("review",       rv, session)
   mod_clean_server("clean",         rv, session)
   mod_export_server("export",       rv, session)
-  mod_dashboard_server("dashboard", rv)
+  mod_dashboard_server("dashboard", rv, session)
 }
 
 shinyApp(ui, server)

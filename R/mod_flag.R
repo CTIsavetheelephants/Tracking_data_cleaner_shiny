@@ -34,25 +34,26 @@ mod_flag_ui <- function(id) {
 
     card(
       card_header("Flagging Parameters"),
-      h6("Spatial Filters"),
-      helpText("Draw a rectangle on the map (right) to flag points outside your study area.",
-               "Click 'Place HQ marker' then click the map to flag points within the HQ buffer."),
-      actionButton(ns("toggle_hq_mode"), "Place HQ marker",
+      h6("Draw Headquarter or Airstrip Buffer as Spatial Filter"),
+      helpText("Click 'Place HQ / airstrip marker' then click the map to flag points",
+               "within the buffer radius below — used to exclude fixes clustered at a",
+               "research base or airstrip."),
+      actionButton(ns("toggle_hq_mode"), "Place HQ / airstrip marker",
                    class = "btn-outline-secondary w-100"),
-      sliderInput(ns("hq_radius_m"), "HQ buffer radius (m)",
+      sliderInput(ns("hq_radius_m"), "Buffer radius (m)",
                   min = 50, max = 5000, value = 500, step = 50),
-      helpText("Points within this distance of the HQ marker will be flagged as 'hq'."),
-      actionButton(ns("clear_hq"),   "Clear HQ marker",
+      helpText("Points within this distance of the marker will be flagged as 'hq'."),
+      actionButton(ns("clear_hq"),   "Clear HQ / airstrip marker",
                    class = "btn-outline-secondary w-100 mt-1"),
       actionButton(ns("clear_bbox"), "Clear bounding box",
                    class = "btn-outline-secondary w-100 mt-1"),
       hr(),
       h6("Speed thresholds"),
-      sliderInput(ns("speed_vehicle"), "Suspicious vehicle (km/h)",
+      sliderInput(ns("speed_vehicle"), "Possible vehicle (km/h)",
                   min = 5, max = 100, value = 25, step = 1),
       helpText("Steps faster than this are flagged as possible vehicle transport.",
                "Elephants rarely exceed 15 km/h; values above ~25 km/h suggest a vehicle."),
-      sliderInput(ns("speed_air"), "Suspicious airborne (km/h)",
+      sliderInput(ns("speed_air"), "Possible airborne (km/h)",
                   min = 50, max = 500, value = 150, step = 10),
       helpText("Steps faster than this are flagged as possible airborne transport",
                "(e.g. collar shipped by plane or helicopter)."),
@@ -122,11 +123,20 @@ mod_flag_ui <- function(id) {
 
     tagList(
       card(
-        card_header("Spatial Filters Map"),
+        card_header("Draw Bounding Box as Spatial Filter"),
         p(class = "text-muted", style = "font-size:0.82rem; margin-bottom:0.4rem",
           "To draw a bounding box: click the", tags$b("rectangle icon"), "in the top-left toolbar on the map, then drag to draw.",
           "Use the trash icon in the same toolbar to remove a drawn rectangle.",
-          "To place HQ: click 'Place HQ marker' on the left, then click the map."),
+          "To place HQ: click 'Place HQ / airstrip marker' on the left, then click the map."),
+        radioButtons(ns("map_plot_mode"), NULL, inline = TRUE,
+                     choices  = c("Plot a sample (faster)" = "sample",
+                                  "Plot all points" = "all"),
+                     selected = "sample"),
+        helpText(style = "font-size:0.78rem; margin-top:-0.35rem;",
+                 "A sample plots quickly and keeps the map responsive on large",
+                 "datasets (the default). Switch to", tags$b("Plot all points"),
+                 "to see every outlier before finalising a tight box — this can be",
+                 "slow to load and pan on very large datasets (100k+ fixes)."),
         leafletOutput(ns("spatial_map"), height = "380px"),
         uiOutput(ns("spatial_status"))
       ),
@@ -165,16 +175,35 @@ mod_flag_server <- function(id, rv, parent_session) {
     })
 
     # ── Spatial filter map ─────────────────────────────────────────────────
+    # Sample size used when "Plot a sample (faster)" is selected.
+    .map_sample_n <- 10000L
+
+    # All finite WGS84 coordinates of the current data (matrix of lon/lat).
+    .map_all_coords <- function() {
+      cc <- sf::st_coordinates(sf::st_transform(rv$data_raw, 4326))
+      cc[is.finite(cc[, 1]) & is.finite(cc[, 2]), , drop = FALSE]
+    }
+    # Coordinates to plot for the chosen mode (systematic sample keeps the
+    # spatial spread representative rather than clustering on one animal/period).
+    .map_plot_coords <- function(coords, mode) {
+      n_all <- nrow(coords)
+      if (identical(mode, "sample") && n_all > .map_sample_n)
+        coords <- coords[round(seq(1, n_all, length.out = .map_sample_n)), , drop = FALSE]
+      coords
+    }
+
+    # Base map + initial points.  Zoom to the full extent (all points) so every
+    # outlier is visible for drawing an accurate box.  The toggle observer below
+    # re-plots points via a proxy so flipping all/sample never rebuilds the map
+    # (which would wipe a drawn rectangle or HQ marker).
     output$spatial_map <- renderLeaflet({
       req(rv$data_raw)
-      d <- rv$data_raw
-      if (nrow(d) > 5000)
-        d <- d[round(seq(1, nrow(d), length.out = 5000)), ]
-      coords  <- sf::st_coordinates(sf::st_transform(d, 4326))
-      lon_q   <- quantile(coords[, 1], c(0.25, 0.75), na.rm = TRUE)
-      lat_q   <- quantile(coords[, 2], c(0.25, 0.75), na.rm = TRUE)
+      coords  <- .map_all_coords()
+      lon_rng <- range(coords[, 1], na.rm = TRUE)
+      lat_rng <- range(coords[, 2], na.rm = TRUE)
+      pts     <- .map_plot_coords(coords, isolate(input$map_plot_mode) %||% "sample")
 
-      leaflet() %>%
+      leaflet(options = leafletOptions(preferCanvas = TRUE)) %>%
         addProviderTiles("Esri.WorldImagery") %>%
         addTiles(
           "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
@@ -191,20 +220,28 @@ mod_flag_server <- function(id, rv, parent_session) {
           editOptions         = editToolbarOptions(edit = FALSE, remove = TRUE)
         ) %>%
         addCircleMarkers(
-          lng         = coords[, 1],
-          lat         = coords[, 2],
-          radius      = 5,
-          color       = "#3388ff",
-          fillColor   = "#3388ff",
-          fillOpacity = 0.6,
-          stroke      = FALSE,
-          group       = "data_pts"
+          lng = pts[, 1], lat = pts[, 2], radius = 3,
+          color = "#3388ff", fillColor = "#3388ff",
+          fillOpacity = 0.6, stroke = FALSE, group = "data_pts"
         ) %>%
         fitBounds(
-          lng1 = lon_q[[1]], lat1 = lat_q[[1]],
-          lng2 = lon_q[[2]], lat2 = lat_q[[2]]
+          lng1 = lon_rng[[1]], lat1 = lat_rng[[1]],
+          lng2 = lon_rng[[2]], lat2 = lat_rng[[2]]
         )
     })
+
+    # Re-plot points when the all/sample toggle flips (map already exists).
+    observeEvent(input$map_plot_mode, {
+      req(rv$data_raw)
+      pts <- .map_plot_coords(.map_all_coords(), input$map_plot_mode %||% "sample")
+      leafletProxy(session$ns("spatial_map"), session) %>%
+        clearGroup("data_pts") %>%
+        addCircleMarkers(
+          lng = pts[, 1], lat = pts[, 2], radius = 3,
+          color = "#3388ff", fillColor = "#3388ff",
+          fillOpacity = 0.6, stroke = FALSE, group = "data_pts"
+        )
+    }, ignoreInit = TRUE)
 
     # Redraw HQ marker + buffer whenever rv$hq_point or hq_radius_m changes
     observe({
@@ -279,7 +316,8 @@ mod_flag_server <- function(id, rv, parent_session) {
     observeEvent(input$toggle_hq_mode, {
       hq_mode(!hq_mode())
       updateActionButton(session, "toggle_hq_mode",
-                         label = if (hq_mode()) "Click map to place HQ ✓" else "Place HQ marker")
+                         label = if (hq_mode()) "Click map to place marker ✓"
+                                 else "Place HQ / airstrip marker")
     })
 
     # Map click → set HQ when in HQ mode
@@ -289,8 +327,8 @@ mod_flag_server <- function(id, rv, parent_session) {
       rv$hq_point <- list(lon = click$lng, lat = click$lat,
                           radius_m = input$hq_radius_m)
       hq_mode(FALSE)
-      updateActionButton(session, "toggle_hq_mode", label = "Place HQ marker")
-      showNotification("HQ marker placed.", type = "message")
+      updateActionButton(session, "toggle_hq_mode", label = "Place HQ / airstrip marker")
+      showNotification("HQ / airstrip marker placed.", type = "message")
     })
 
     observeEvent(input$clear_hq, {
@@ -315,8 +353,15 @@ mod_flag_server <- function(id, rv, parent_session) {
         paste0("Bbox: lon ", round(rv$bbox$lon_min, 3), " – ", round(rv$bbox$lon_max, 3),
                ", lat ", round(rv$bbox$lat_min, 3), " – ", round(rv$bbox$lat_max, 3))
       else "Bbox: not set"
+      n_all    <- if (!is.null(rv$data_raw)) nrow(rv$data_raw) else 0L
+      pts_txt  <- if (identical(input$map_plot_mode %||% "sample", "sample") &&
+                      n_all > .map_sample_n)
+        paste0("Showing a sample of ", format(.map_sample_n, big.mark = ","),
+               " of ", format(n_all, big.mark = ","), " fixes")
+      else
+        paste0("Showing all ", format(n_all, big.mark = ","), " fixes")
       tags$p(class = "text-muted", style = "font-size:0.8rem; margin:0.4rem 0 0",
-             hq_txt, tags$br(), bbox_txt)
+             pts_txt, tags$br(), hq_txt, tags$br(), bbox_txt)
     })
 
     # ── Run flagging ───────────────────────────────────────────────────────
@@ -490,7 +535,16 @@ mod_flag_server <- function(id, rv, parent_session) {
     })
 
     output$flag_table <- renderDT({
-      flag_summary()
+      lbl <- c(ok = "Clean",
+               suspicious_vehicle  = "Possible vehicle",
+               suspicious_airborne = "Possible airborne",
+               predeployment       = "Pre-deployment",
+               immobility          = "Immobility",
+               shift_episode       = "Shift episode",
+               outside_bbox        = "Outside bounding box",
+               hq                  = "HQ / airstrip buffer")
+      flag_summary() %>%
+        dplyr::mutate(Flag = dplyr::coalesce(unname(lbl[Flag]), Flag))
     }, options = list(dom = "t", pageLength = 10), rownames = FALSE)
 
     output$ind_flag_tbl <- renderDT({

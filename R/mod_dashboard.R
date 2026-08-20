@@ -6,8 +6,31 @@ mod_dashboard_ui <- function(id) {
       .compact-kpi .value-box-value { font-size: 1.25rem !important; }
       .compact-kpi .value-box-title { font-size: 0.82rem !important; }
       .compact-kpi .value-box-showcase { font-size: 1.2rem !important; }
+      .track-legend .checkbox { margin-top: 2px !important; margin-bottom: 2px !important; }
+      .track-legend label { font-weight: 400 !important; }
     "),
     uiOutput(ns("kpi_boxes")),
+
+    # ── Individual tracks map ──────────────────────────────────────────────
+    card(
+      card_header("Individual tracks"),
+      layout_columns(
+        col_widths = c(3, 9),
+        div(
+          helpText(style = "font-size:0.8rem;",
+                   "Tick individuals to draw their tracks. All are unticked by",
+                   "default so the map loads instantly — tick only who you need."),
+          div(class = "d-flex gap-1 mb-2",
+              actionButton(ns("tracks_all"),  "Select all", class = "btn-sm btn-outline-primary flex-fill"),
+              actionButton(ns("tracks_none"), "Clear all",  class = "btn-sm btn-outline-secondary flex-fill")),
+          div(class = "track-legend",
+              style = "max-height:500px; overflow-y:auto; padding-right:4px;",
+              uiOutput(ns("tracks_checkboxes")))
+        ),
+        leafletOutput(ns("tracks_map"), height = "540px")
+      )
+    ),
+
     layout_columns(
       col_widths = c(8, 4),
       card(
@@ -22,14 +45,120 @@ mod_dashboard_ui <- function(id) {
     card(
       card_header("Fix count by individual and month"),
       uiOutput(ns("heatmap_ui"))
-    )
+    ),
+    div(class = "d-flex justify-content-end mt-2 mb-3",
+        actionButton(ns("to_export"), "Proceed to Step 7: Export →",
+                     class = "btn-primary"))
   )
 }
 
-mod_dashboard_server <- function(id, rv) {
+mod_dashboard_server <- function(id, rv, parent_session) {
   moduleServer(id, function(input, output, session) {
 
     clean <- reactive({ build_clean_data(rv) })
+
+    # Data used for the map / summaries — cleaned if available, else raw.
+    dash_data <- reactive({ clean() %||% rv$data_raw })
+
+    # WGS84 lon/lat for an sf object, preferring existing columns over a
+    # (potentially expensive) reprojection of the geometry.
+    .wgs <- function(d_sf) {
+      df <- sf::st_drop_geometry(d_sf)
+      if (all(c("lon_wgs", "lat_wgs") %in% names(df)))
+        return(list(lon = df$lon_wgs, lat = df$lat_wgs))
+      if (all(c("lon", "lat") %in% names(df)))
+        return(list(lon = df$lon, lat = df$lat))
+      cc <- sf::st_coordinates(sf::st_transform(d_sf, 4326))
+      list(lon = cc[, 1], lat = cc[, 2])
+    }
+
+    track_inds <- reactive({
+      req(rv$data_raw)
+      sort(unique(dash_data()$name))
+    })
+
+    # Stable name → colour map (distinct hues) shared by legend + map.
+    track_colors <- reactive({
+      inds <- track_inds()
+      stats::setNames(grDevices::hcl.colors(max(1, length(inds)), "Dark 3"), inds)
+    })
+
+    # ── Track legend (coloured checkboxes) ─────────────────────────────────
+    output$tracks_checkboxes <- renderUI({
+      inds <- track_inds()
+      cols <- track_colors()
+      req(length(inds) > 0)
+      choice_names <- lapply(seq_along(inds), function(k)
+        tags$span(
+          tags$span(style = paste0("display:inline-block; width:16px; height:3px; ",
+                                    "background:", cols[[k]], "; margin-right:6px; ",
+                                    "vertical-align:middle;")),
+          tags$span(style = "font-size:0.82rem;", inds[k])
+        ))
+      checkboxGroupInput(session$ns("tracks_select"), NULL,
+                         choiceNames  = choice_names,
+                         choiceValues = inds,
+                         selected     = character(0))
+    })
+
+    observeEvent(input$tracks_all,  {
+      updateCheckboxGroupInput(session, "tracks_select", selected = track_inds())
+    })
+    observeEvent(input$tracks_none, {
+      updateCheckboxGroupInput(session, "tracks_select", selected = character(0))
+    })
+
+    # ── Base map (no tracks until an individual is ticked) ─────────────────
+    output$tracks_map <- renderLeaflet({
+      req(rv$data_raw)
+      w   <- .wgs(dash_data())
+      keep <- is.finite(w$lon) & is.finite(w$lat)
+      lon_r <- range(w$lon[keep]); lat_r <- range(w$lat[keep])
+      leaflet(options = leafletOptions(preferCanvas = TRUE)) %>%
+        addProviderTiles("Esri.WorldImagery") %>%
+        addTiles(
+          "https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+          options = tileOptions(opacity = 0.9)
+        ) %>%
+        addScaleBar() %>%
+        fitBounds(lng1 = lon_r[[1]], lat1 = lat_r[[1]],
+                  lng2 = lon_r[[2]], lat2 = lat_r[[2]])
+    })
+
+    # Draw only the ticked individuals' tracks (on demand keeps it fast).
+    observeEvent(input$tracks_select, {
+      proxy <- leafletProxy(session$ns("tracks_map"), session) %>%
+        clearGroup("tracks")
+      selv <- input$tracks_select
+      if (length(selv) > 0) {
+        d    <- dash_data()
+        cols <- track_colors()
+        for (nm in selv) {
+          di <- d %>%
+            dplyr::filter(name == nm) %>%
+            dplyr::arrange(timestamp_corrected)
+          n <- nrow(di)
+          if (n < 2) next
+          w   <- .wgs(di)
+          idx <- if (n > 5000) round(seq(1, n, length.out = 5000)) else seq_len(n)
+          proxy <- proxy %>%
+            addPolylines(
+              lng     = w$lon[idx],
+              lat     = w$lat[idx],
+              color   = cols[[nm]],
+              weight  = 2,
+              opacity = 0.85,
+              group   = "tracks",
+              label   = nm
+            )
+        }
+      }
+      proxy
+    }, ignoreNULL = FALSE, ignoreInit = TRUE)
+
+    observeEvent(input$to_export, {
+      nav_select("main_nav", "Step 7: Export", session = parent_session)
+    })
 
     # ── KPI value boxes ────────────────────────────────────────────────────
     output$kpi_boxes <- renderUI({

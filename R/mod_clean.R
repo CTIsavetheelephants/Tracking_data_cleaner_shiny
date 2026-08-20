@@ -26,7 +26,7 @@ mod_clean_ui <- function(id) {
       actionButton(ns("undo_last"), "Undo last addition",
                    class = "btn-outline-danger w-100 mt-1"),
       hr(),
-      actionButton(ns("complete"), "Complete clean → Step 6: Export",
+      actionButton(ns("complete"), "Complete clean → Step 6: Dashboard and Final Review",
                    class = "btn-primary w-100")
     ),
 
@@ -377,7 +377,7 @@ mod_clean_server <- function(id, rv, parent_session) {
         paste0("Clean complete. ", n, " manual removal(s) saved."),
         type = "message", duration = 5
       )
-      nav_select("main_nav", "Step 6: Export", session = parent_session)
+      nav_select("main_nav", "Step 6: Dashboard and Final Review", session = parent_session)
     })
 
   })

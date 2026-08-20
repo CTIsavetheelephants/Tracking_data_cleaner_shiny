@@ -189,17 +189,45 @@ mod_ingest_server <- function(id, rv, parent_session) {
     # Per-file summary: file name | raw rows | after per-file prep | final (after cross-file dedup)
     ingest_file_summary <- reactiveVal(NULL)
 
+    # Per-file forced manual mapping: named list keyed by file index (as string)
+    # → reason ("id" | "coord" | "timestamp").  Set when a Prepare attempt found
+    # a file whose required columns could not be resolved automatically; forces
+    # that file's manual column picker open even if name-based detection passed.
+    manual_force <- reactiveVal(list())
+
+    # Staged (not-yet-committed) sex assignments: named list  name → sex.
+    # Lets the user work through many individuals — each is recorded the moment a
+    # sex is picked and drops off the worklist — then commit them all in one go.
+    pending_sex <- reactiveVal(list())
+
+    # Individuals that still need a sex: those with no male/female in the data and
+    # not already staged this session.  `show_all` includes everyone (for
+    # re-correcting).  Reads reactive state — wrap in isolate() where a static
+    # snapshot is wanted.
+    sex_worklist <- function(show_all = FALSE) {
+      ps <- names(pending_sex())
+      sx <- rv$data_raw %>% sf::st_drop_geometry() %>%
+        dplyr::group_by(name) %>%
+        dplyr::summarise(has_sex = any(sex %in% c("male", "female")),
+                         .groups = "drop")
+      handled <- sx$has_sex | sx$name %in% ps
+      list(inds = sort(sx$name[show_all | !handled]), n_left = sum(!handled))
+    }
+
     # ── Reset when Start Over clears rv$study_area ─────────────────────────
     observeEvent(rv$study_area, {
       req(is.null(rv$study_area))
       file_samples(list())
       ingest_file_summary(NULL)
+      manual_force(list())
+      pending_sex(list())
       updateTextInput(session,  "study_area", value = "")
       updateNumericInput(session, "crs_xy",   value = NA)
     }, ignoreNULL = FALSE, ignoreInit = TRUE)
 
     # ── Read all uploaded files into cache ─────────────────────────────────
     observeEvent(input$files, {
+      manual_force(list())   # clear any stale forced-mapping flags on new upload
       n_files <- nrow(input$files)
       withProgress(message = "Reading uploaded files…", value = 0, {
         samps <- vector("list", n_files)
@@ -221,6 +249,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
       req(!is.null(input$files))
       fnames <- input$files$name
       samps  <- file_samples()   # list; may be empty while upload is processing
+      forced <- manual_force()   # per-file forced mapping reasons (from failed prepare)
 
       tagList(
         hr(),
@@ -247,6 +276,20 @@ mod_ingest_server <- function(id, rv, parent_session) {
             sp_vals <- sort(unique(sp_raw[!is.na(sp_raw) & nzchar(trimws(sp_raw))]))
             n_blank <- sum(is.na(samp[[sp_col]]) | !nzchar(trimws(sp_raw)))
           }
+          # A species column that is entirely blank (common with Iridium collars)
+          # is treated like no species column — the user confirms via the
+          # "All rows are elephant" checkbox instead of filtering on it.
+          has_usable_species <- isTRUE(has_sp_col) && length(sp_vals) > 0
+
+          # Which columns need manual mapping: auto-detection failed, OR a prior
+          # Prepare attempt reported this file couldn't be resolved (forced).
+          f_reason   <- forced[[as.character(i)]]   # NULL or "id"/"coord"/"timestamp"
+          need_id    <- !still_load && length(all_cols) > 0 &&
+                        (!has_auto_name_col(all_cols)       || identical(f_reason, "id"))
+          need_coord <- !still_load && length(all_cols) > 0 &&
+                        (!has_auto_coord_cols(all_cols)     || identical(f_reason, "coord"))
+          need_ts    <- !still_load && length(all_cols) > 0 &&
+                        (!has_auto_timestamp_cols(all_cols) || identical(f_reason, "timestamp"))
 
           div(
             style = paste0(
@@ -285,9 +328,12 @@ mod_ingest_server <- function(id, rv, parent_session) {
             # ── Species ─────────────────────────────────────────────────
             if (still_load) {
               helpText("Detecting columns…")
-            } else if (isFALSE(has_sp_col)) {
+            } else if (!has_usable_species) {
               tagList(
-                helpText("No species column detected in this file."),
+                helpText(if (isTRUE(has_sp_col))
+                           "Species column is present but empty in this file."
+                         else
+                           "No species column detected in this file."),
                 checkboxInput(
                   session$ns(paste0("all_elephant_", i)),
                   "All rows in this file are elephant",
@@ -336,13 +382,10 @@ mod_ingest_server <- function(id, rv, parent_session) {
               )
             },
 
-            # ── Manual column mapping (shown only when auto-detection fails) ──
+            # ── Manual column mapping (shown when auto-detection fails, or when
+            #    a Prepare attempt could not resolve the columns for this file) ──
             if (!still_load && length(all_cols) > 0 &&
-                (!has_auto_name_col(all_cols) || !has_auto_coord_cols(all_cols) ||
-                 !has_auto_timestamp_cols(all_cols))) {
-              need_id    <- !has_auto_name_col(all_cols)
-              need_coord <- !has_auto_coord_cols(all_cols)
-              need_ts    <- !has_auto_timestamp_cols(all_cols)
+                (need_id || need_coord || need_ts)) {
               needs <- c(if (need_id) "an ID column",
                          if (need_coord) "coordinate columns",
                          if (need_ts) "date & time columns")
@@ -390,6 +433,16 @@ mod_ingest_server <- function(id, rv, parent_session) {
                   ),
                 if (need_ts)
                   tagList(
+                    selectizeInput(
+                      session$ns(paste0("datetime_col_", i)),
+                      "Combined date & time column",
+                      choices  = c("--- select ---" = "", all_cols),
+                      selected = "",
+                      width    = "100%",
+                      options  = list(placeholder = "--- select ---", maxOptions = 300)
+                    ),
+                    tags$p(style = "font-size:0.72rem; color:#6c757d; text-align:center; margin:0.1rem 0;",
+                           "— or, if date and time are in separate columns —"),
                     div(
                       class = "prefilter-pair",
                       style = "display:flex; gap:0.5rem; align-items:flex-start;",
@@ -406,7 +459,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
                       div(style = "flex:1; min-width:0;",
                         selectizeInput(
                           session$ns(paste0("time_col_", i)),
-                          "Time column (separate from date)",
+                          "Time column",
                           choices  = c("--- select ---" = "", all_cols),
                           selected = "",
                           width    = "100%",
@@ -415,8 +468,8 @@ mod_ingest_server <- function(id, rv, parent_session) {
                       )
                     ),
                     helpText(style = "font-size:0.72rem; margin-top:-0.2rem;",
-                             "Only for files where the date and time of each fix are in",
-                             "two separate columns.")
+                             "Pick the single column holding the full timestamp, or a",
+                             "date column and a time column to combine.")
                   )
               )
             },
@@ -487,6 +540,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
     observeEvent(input$run, {
       n_files <- if (!is.null(input$files)) nrow(input$files) else 0L
       samps   <- file_samples()
+      forced  <- manual_force()   # per-file reasons a prior Prepare attempt flagged
 
       # --- Validation -------------------------------------------------------
       missing <- character(0)
@@ -499,35 +553,39 @@ mod_ingest_server <- function(id, rv, parent_session) {
 
       for (i in seq_len(n_files)) {
         samp       <- if (i <= length(samps)) samps[[i]] else NULL
-        has_sp_col <- !is.null(samp) && "species" %in% tolower(names(samp))
-        if (!has_sp_col && !isTRUE(input[[paste0("all_elephant_", i)]])) {
+        sp_usable  <- !is.null(samp) && species_usable(samp)
+        if (!sp_usable && !isTRUE(input[[paste0("all_elephant_", i)]])) {
           missing <- c(missing,
             paste0("File ‘", input$files$name[i],
-                   "’: no species column detected — ",
+                   "’: no usable species column (missing or empty) — ",
                    "tick ‘All rows are elephant’ to proceed"))
         }
-        # Manual column mapping required when auto-detection failed
-        cols_i <- if (!is.null(samp)) names(samp) else character(0)
+        # Manual column mapping required when auto-detection failed, or when a
+        # prior Prepare attempt flagged this file as needing a manual mapping.
+        cols_i   <- if (!is.null(samp)) names(samp) else character(0)
+        f_reason <- forced[[as.character(i)]]
         if (length(cols_i) > 0) {
-          if (!has_auto_name_col(cols_i) &&
+          if ((!has_auto_name_col(cols_i) || identical(f_reason, "id")) &&
               !nzchar(trimws(input[[paste0("id_col_", i)]] %||% ""))) {
             missing <- c(missing,
               paste0("File ‘", input$files$name[i],
                      "’: select an ID / individual column"))
           }
-          if (!has_auto_coord_cols(cols_i) &&
+          if ((!has_auto_coord_cols(cols_i) || identical(f_reason, "coord")) &&
               (!nzchar(trimws(input[[paste0("lat_col_", i)]] %||% "")) ||
                !nzchar(trimws(input[[paste0("lon_col_", i)]] %||% "")))) {
             missing <- c(missing,
               paste0("File ‘", input$files$name[i],
                      "’: select latitude and longitude columns"))
           }
-          if (!has_auto_timestamp_cols(cols_i) &&
-              (!nzchar(trimws(input[[paste0("date_col_", i)]] %||% "")) ||
-               !nzchar(trimws(input[[paste0("time_col_", i)]] %||% "")))) {
-            missing <- c(missing,
-              paste0("File ‘", input$files$name[i],
-                     "’: select date and time columns"))
+          if (!has_auto_timestamp_cols(cols_i) || identical(f_reason, "timestamp")) {
+            dt_ok   <- nzchar(trimws(input[[paste0("datetime_col_", i)]] %||% ""))
+            pair_ok <- nzchar(trimws(input[[paste0("date_col_", i)]] %||% "")) &&
+                       nzchar(trimws(input[[paste0("time_col_", i)]] %||% ""))
+            if (!dt_ok && !pair_ok)
+              missing <- c(missing,
+                paste0("File ‘", input$files$name[i],
+                       "’: select a combined date/time column, or a date column and a time column"))
           }
         }
       }
@@ -559,13 +617,13 @@ mod_ingest_server <- function(id, rv, parent_session) {
               detail  = file_names[i]
             )
             samp       <- if (i <= length(samps)) samps[[i]] else NULL
-            has_sp_col <- !is.null(samp) && "species" %in% tolower(names(samp))
+            sp_usable  <- !is.null(samp) && species_usable(samp)
 
-            all_elephant       <- !has_sp_col &&
+            all_elephant       <- !sp_usable &&
                                   isTRUE(input[[paste0("all_elephant_", i)]])
-            filter_elephant    <-  has_sp_col &&
+            filter_elephant    <-  sp_usable &&
                                   isTRUE(input[[paste0("filter_elephant_", i)]])
-            include_na_species <-  has_sp_col && filter_elephant &&
+            include_na_species <-  sp_usable && filter_elephant &&
                                   isTRUE(input[[paste0("include_na_species_", i)]])
 
             fcol <- trimws(input[[paste0("filter_col_", i)]] %||% "")
@@ -576,6 +634,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
             lon_sel  <- trimws(input[[paste0("lon_col_",  i)]] %||% "")
             date_sel <- trimws(input[[paste0("date_col_", i)]] %||% "")
             time_sel <- trimws(input[[paste0("time_col_", i)]] %||% "")
+            dt_sel   <- trimws(input[[paste0("datetime_col_", i)]] %||% "")
 
             tryCatch({
               prepped <- prep_elephant_csv(
@@ -593,8 +652,12 @@ mod_ingest_server <- function(id, rv, parent_session) {
                 manual_lat_col     = if (nzchar(lat_sel))  lat_sel  else NULL,
                 manual_lon_col     = if (nzchar(lon_sel))  lon_sel  else NULL,
                 manual_date_col    = if (nzchar(date_sel)) date_sel else NULL,
-                manual_time_col    = if (nzchar(time_sel)) time_sel else NULL
+                manual_time_col    = if (nzchar(time_sel)) time_sel else NULL,
+                manual_datetime_col = if (nzchar(dt_sel))  dt_sel   else NULL
               )
+              # prep couldn't resolve a required column class — pass the signal
+              # straight through so the run handler can force the manual picker.
+              if (is_need_mapping(prepped)) return(prepped)
               # Apply name corrections per-file so that combine_prepped sees
               # canonical names and its rolling 5-minute dedup correctly merges
               # near-duplicate fixes from sources that used different name conventions.
@@ -626,6 +689,33 @@ mod_ingest_server <- function(id, rv, parent_session) {
               NULL
             })
           })
+
+          # Intercept files prep couldn't resolve: force their manual pickers open
+          # (keyed by file index) instead of dead-ending on an error.
+          reasons  <- vapply(prepped_list,
+                             function(x) if (is_need_mapping(x)) x$reason else NA_character_,
+                             character(1))
+          need_idx <- which(!is.na(reasons))
+          if (length(need_idx) > 0) {
+            mf <- as.list(reasons[need_idx]); names(mf) <- as.character(need_idx)
+            manual_force(mf)
+            label <- c(id = "an ID column", coord = "coordinate columns",
+                       timestamp = "date & time columns")
+            items <- vapply(need_idx, function(k) paste0(
+              "‘", file_names[k], "’ — select ", label[[reasons[k]]]), character(1))
+            showNotification(
+              tags$div(
+                tags$b("Some columns couldn’t be identified automatically."),
+                tags$br(),
+                "Please map them in the per-file settings, then click Prepare again:",
+                tags$ul(lapply(items, tags$li))
+              ),
+              type = "warning", duration = NULL
+            )
+            session$sendCustomMessage("scrollToId",
+                                      list(id = session$ns("per_file_ui")))
+            return()
+          }
 
           prepped_list <- Filter(Negate(is.null), prepped_list)
 
@@ -666,6 +756,7 @@ mod_ingest_server <- function(id, rv, parent_session) {
 
           rv$data_raw   <- dat
           rv$study_area <- trimws(input$study_area)
+          pending_sex(list())   # clear any staged sex assignments from a prior run
           data_prepared(TRUE)
           session$sendCustomMessage("scrollToId",
                                     list(id = session$ns("post_prep_anchor")))
@@ -853,19 +944,79 @@ mod_ingest_server <- function(id, rv, parent_session) {
         actionButton(session$ns("apply_name_fix"), "Apply name correction",
                      class = "btn-warning w-100 mt-1"),
 
-        # ── Sex corrections ────────────────────────────────────────────
+        # ── Sex assignment (batch) ─────────────────────────────────────
         hr(),
-        h6("Correct sex assignments (Optional)"),
-        helpText("Select an individual to correct their sex across all rows."),
-        selectInput(session$ns("sex_ind"), "Individual",
-                    choices = c("— select —" = "", inds)),
+        h6("Assign / correct sex (Optional)"),
+        helpText(
+          "Pick an individual, then pick its sex — the assignment is recorded",
+          "automatically and the individual drops off the list, so you don't",
+          "click anything per animal. Work through all of them, then press",
+          tags$b("Apply all"), "at the bottom to commit them in one go."
+        ),
+        {
+          wl <- isolate(sex_worklist(isTRUE(input$sex_show_all)))
+          tagList(
+            checkboxInput(session$ns("sex_show_all"),
+                          "Show all individuals (including those already assigned)",
+                          value = isTRUE(isolate(input$sex_show_all))),
+            selectInput(session$ns("sex_ind"),
+                        sprintf("Individual (%d still need a sex)", wl$n_left),
+                        choices = c("— select —" = "", wl$inds))
+          )
+        },
         uiOutput(session$ns("current_sex_display")),
-        selectInput(session$ns("new_sex"), "Corrected sex",
+        selectInput(session$ns("new_sex"), "Sex",
                     choices = c("— select —" = "", "male", "female", "unknown")),
-        actionButton(session$ns("apply_sex_fix"), "Apply sex correction",
-                     class = "btn-warning w-100 mt-1")
+        uiOutput(session$ns("staged_sex_ui"))
       )
     })
+
+    # Keep the sex worklist dropdown in sync — reacts to the data, the "show all"
+    # toggle, and staged assignments — without re-rendering the whole panel.
+    observeEvent(list(rv$data_raw, input$sex_show_all, pending_sex()), {
+      req(rv$data_raw)
+      wl <- sex_worklist(isTRUE(input$sex_show_all))
+      updateSelectInput(session, "sex_ind",
+                        label   = sprintf("Individual (%d still need a sex)", wl$n_left),
+                        choices = c("— select —" = "", wl$inds))
+    }, ignoreInit = TRUE)
+
+    # Auto-stage: recording a sex for the selected individual needs no button.
+    observeEvent(input$new_sex, {
+      req(rv$data_raw)
+      ind <- input$sex_ind %||% ""
+      sx  <- input$new_sex %||% ""
+      if (!nzchar(ind) || ind == "— select —" ||
+          !nzchar(sx)  || sx  == "— select —") return()
+      ps <- pending_sex(); ps[[ind]] <- sx; pending_sex(ps)
+      # Reset the sex picker; the worklist observer drops `ind` from the list.
+      updateSelectInput(session, "new_sex", selected = "")
+    }, ignoreInit = TRUE)
+
+    # Staged-assignments panel + the single commit button (updates live).
+    output$staged_sex_ui <- renderUI({
+      ps <- pending_sex()
+      if (length(ps) == 0)
+        return(tags$p(class = "text-muted",
+                      style = "font-size:0.78rem; margin:0.5rem 0;",
+                      "No sex assignments staged yet."))
+      badges <- lapply(names(ps), function(nm)
+        tags$span(class = "badge bg-secondary",
+                  style = "margin:2px; font-weight:normal;",
+                  paste0(nm, " → ", ps[[nm]])))
+      tagList(
+        tags$p(style = "font-size:0.78rem; font-weight:600; margin:0.5rem 0 0.2rem;",
+               sprintf("%d assignment(s) staged (not yet applied):", length(ps))),
+        div(style = "max-height:140px; overflow-y:auto; margin-bottom:0.5rem;", badges),
+        actionButton(session$ns("apply_sex_fix"),
+                     sprintf("Apply all %d sex assignment(s)", length(ps)),
+                     class = "btn-warning w-100"),
+        actionButton(session$ns("clear_staged_sex"), "Clear staged list",
+                     class = "btn-outline-secondary btn-sm w-100 mt-1")
+      )
+    })
+
+    observeEvent(input$clear_staged_sex, { pending_sex(list()) })
 
     # ── Name corrections: open modal so the file picker doesn't scroll the page
     observeEvent(input$open_corr_modal, {
@@ -967,16 +1118,14 @@ mod_ingest_server <- function(id, rv, parent_session) {
     })
 
     observeEvent(input$apply_sex_fix, {
-      req(rv$data_raw,
-          nzchar(input$sex_ind %||% ""),
-          nzchar(input$new_sex %||% ""),
-          input$sex_ind != "— select —",
-          input$new_sex  != "— select —")
+      ps <- pending_sex()
+      req(rv$data_raw, length(ps) > 0)
       dat <- rv$data_raw
-      dat$sex[dat$name == input$sex_ind] <- input$new_sex
+      for (nm in names(ps)) dat$sex[dat$name == nm] <- ps[[nm]]
       rv$data_raw <- dat
+      pending_sex(list())
       showNotification(
-        paste0("Sex for '", input$sex_ind, "' corrected to '", input$new_sex, "'."),
+        sprintf("%d sex assignment(s) applied.", length(ps)),
         type = "message", duration = 4
       )
     })

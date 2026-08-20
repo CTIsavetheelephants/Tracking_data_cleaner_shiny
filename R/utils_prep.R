@@ -134,11 +134,29 @@ DATE_COL_CANDIDATES <- c("date", "utc_date", "gps_date", "gmt_date", "local_date
 TIME_COL_CANDIDATES <- c("time", "utc_time", "gps_time", "gmt_time", "local_time",
                          "time_utc", "fix_time", "localtime")
 
+# TRUE if df has a species column containing at least one non-blank value.
+# An entirely-empty species column (common with Iridium collars) is NOT usable,
+# so the caller falls back to the "all rows are elephant" confirmation instead.
+species_usable <- function(df) {
+  idx <- which(tolower(names(df)) == "species")
+  if (length(idx) == 0) return(FALSE)
+  v <- as.character(df[[idx[1]]])
+  any(!is.na(v) & nzchar(trimws(v)))
+}
+
 # TRUE if any column would be auto-recognised as the individual identifier.
 has_auto_name_col <- function(nms) {
   nl <- tolower(nms)
   any(nl %in% NAME_COL_CANDIDATES) || any(nl %in% TAG_COL_CANDIDATES)
 }
+
+# Structural-failure sentinel: prep could not identify a required class of
+# column ("id", "coord", or "timestamp").  Returned instead of crashing / a bare
+# NULL so the ingest step can force the manual column picker open for that file
+# rather than dead-ending on an error.
+prep_need_mapping <- function(reason)
+  structure(list(reason = reason), class = "prep_need_mapping")
+is_need_mapping <- function(x) inherits(x, "prep_need_mapping")
 
 # TRUE if a timestamp is auto-recognisable — either a single combined timestamp
 # column, or a separate date column paired with a time column.
@@ -267,7 +285,8 @@ prep_elephant_csv <- function(file,
                                manual_lat_col     = NULL,
                                manual_lon_col     = NULL,
                                manual_date_col    = NULL,
-                               manual_time_col    = NULL) {
+                               manual_time_col    = NULL,
+                               manual_datetime_col = NULL) {
 
   message("Processing: ", basename(file))
 
@@ -341,8 +360,10 @@ prep_elephant_csv <- function(file,
   dat <- rename_ci(dat, "extra__subject__name",        "name")
   if (!any(tolower(names(dat)) %in% "name")) dat <- rename_ci(dat, "id", "name")
   # Collar / tag identifier — becomes the individual name when no explicit name
-  # column exists (e.g. Savannah Tracking exports keyed only by TagId).
-  if (!("tag" %in% tolower(names(dat)))) {
+  # column exists (e.g. Savannah Tracking exports keyed by Tag or TagId).
+  # Guard on the exact lowercase name so a differently-cased column (e.g. "Tag")
+  # is still normalised to "tag" rather than being mistaken for an existing one.
+  if (!("tag" %in% names(dat))) {
     .tag_col <- pick_col(names(dat), TAG_COL_CANDIDATES)
     if (!is.na(.tag_col)) names(dat)[names(dat) == .tag_col] <- "tag"
   }
@@ -352,6 +373,15 @@ prep_elephant_csv <- function(file,
   dat <- rename_ci(dat, "Timestamp",            "fixtime")
   dat <- rename_ci(dat, "timestamp",            "fixtime")
   dat <- rename_ci(dat, "timestamp_corrected",  "fixtime")
+  # Manual override: user-selected single combined date/time column
+  if (!"fixtime" %in% tolower(names(dat)) &&
+      !is.null(manual_datetime_col) && nzchar(trimws(manual_datetime_col))) {
+    hit <- which(tolower(names(dat)) == tolower(trimws(manual_datetime_col)))
+    if (length(hit) == 1) {
+      names(dat)[hit] <- "fixtime"
+      message("Using user-selected date/time column '", manual_datetime_col, "'")
+    }
+  }
   # Combine separate Date + Time columns when no combined timestamp column exists
   if (!"fixtime" %in% tolower(names(dat))) {
     .date_col  <- pick_col(names(dat), DATE_COL_CANDIDATES)
@@ -387,6 +417,12 @@ prep_elephant_csv <- function(file,
       message("Using user-selected ID column '", manual_id_col, "' as individual name")
     }
   }
+  # No individual identifier could be resolved — ask the user to map one.
+  if (!("name" %in% names(dat))) {
+    message("No ID / individual column found in ", basename(file),
+            " — manual mapping required")
+    return(prep_need_mapping("id"))
+  }
   if ("name" %in% names(dat)) {
     dat$name <- trimws(as.character(dat$name))
     n_na <- sum(is.na(dat$name) | dat$name == "")
@@ -402,14 +438,21 @@ prep_elephant_csv <- function(file,
   sp_idx <- which(tolower(names(dat)) == "species")
   if (length(sp_idx) == 1) names(dat)[sp_idx] <- "species"
 
-  if (!"species" %in% names(dat)) {
-    # No species column — user confirmed all rows are elephant via UI checkbox
+  # An entirely-blank species column (common with Iridium collars) is treated
+  # exactly like a missing one: it can't be filtered on, so the user confirms
+  # via the "All rows are elephant" checkbox.
+  species_present <- "species" %in% names(dat) &&
+    any(!is.na(dat$species) & nzchar(trimws(as.character(dat$species))))
+
+  if (!species_present) {
+    # No usable species column — user confirmed all rows are elephant via UI
     if (!all_elephant) {
       message("Skipping ", basename(file),
-              ": no species column and 'All rows are elephant' was not confirmed")
+              ": no usable species column (missing or empty) and ",
+              "'All rows are elephant' was not confirmed")
       return(NULL)
     }
-    dat <- dplyr::mutate(dat, species = "elephant")
+    dat$species <- "elephant"
 
   } else {
     # Standardise all elephant-name variants to "elephant" regardless of
@@ -577,8 +620,9 @@ prep_elephant_csv <- function(file,
         rm(dat_ele2); gc()
       }
     } else {
-      message("Skipping: no lat/lon, WKT geometry, or x/y fields found")
-      return(NULL)
+      message("No coordinate columns found in ", basename(file),
+              " — manual mapping required")
+      return(prep_need_mapping("coord"))
     }
   }
 
@@ -602,7 +646,11 @@ prep_elephant_csv <- function(file,
 
   # Timestamp
   time_col <- pick_col(names(dat_sf), c("fixtime", "date.time", "datetime"))
-  if (is.na(time_col)) { message("Skipping: no timestamp column"); return(NULL) }
+  if (is.na(time_col)) {
+    message("No timestamp column found in ", basename(file),
+            " — manual mapping required")
+    return(prep_need_mapping("timestamp"))
+  }
   ts_raw <- as.character(dat_sf[[time_col]])
 
   # When timestamps are declared as LOCAL time, strip any embedded UTC offset

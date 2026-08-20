@@ -40,7 +40,7 @@ mod_export_ui <- function(id) {
       downloadButton(ns("dl_csv"), "Download cleaned CSV",
                      class = "btn-outline-success w-100"),
       hr(),
-      actionButton(ns("complete"), "Complete → Dashboard",
+      actionButton(ns("complete"), "← Back to Step 6: Dashboard and Final Review",
                    class = "btn-outline-primary w-100")
     )
   ),
@@ -244,7 +244,7 @@ mod_export_server <- function(id, rv, parent_session) {
     )
 
     observeEvent(input$complete, {
-      nav_select("main_nav", "Dashboard", session = parent_session)
+      nav_select("main_nav", "Step 6: Dashboard and Final Review", session = parent_session)
     })
 
     # ── Cleaning report ────────────────────────────────────────────────────
