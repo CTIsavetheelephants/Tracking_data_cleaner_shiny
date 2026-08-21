@@ -158,6 +158,13 @@ prep_need_mapping <- function(reason)
   structure(list(reason = reason), class = "prep_need_mapping")
 is_need_mapping <- function(x) inherits(x, "prep_need_mapping")
 
+# Non-structural failure carrier: prep could not produce usable data for a
+# reason a column picker can't fix (bad coordinates, unparseable timestamps,
+# nothing left after a filter, …).  Carries a human-readable explanation the
+# ingest step surfaces per file instead of a silent drop / generic error.
+prep_failed <- function(message) structure(list(message = message), class = "prep_failed")
+is_prep_failed <- function(x) inherits(x, "prep_failed")
+
 # TRUE if a timestamp is auto-recognisable — either a single combined timestamp
 # column, or a separate date column paired with a time column.
 TIMESTAMP_COL_CANDIDATES <- c("fixtime", "timestamp", "timestamp_corrected",
@@ -176,6 +183,15 @@ has_auto_coord_cols <- function(nms) {
   if ("geometry" %in% nms) return(TRUE)
   !is.na(pick_col(nms, XY_X_CANDIDATES)) && !is.na(pick_col(nms, XY_Y_CANDIDATES))
 }
+
+# The column each auto-detector would pick from a set of names (or NA) — used to
+# show "auto-detected: X" hints in the manual column-mapping UI.
+resolve_name_col <- function(nms)
+  pick_col(nms, c("name", "individual-local-identifier", "id_number",
+                  "extra__subject__name", "id", TAG_COL_CANDIDATES, "name.x", "name.y"))
+resolve_datetime_col <- function(nms) pick_col(nms, TIMESTAMP_COL_CANDIDATES)
+resolve_date_col     <- function(nms) pick_col(nms, DATE_COL_CANDIDATES)
+resolve_time_col     <- function(nms) pick_col(nms, TIME_COL_CANDIDATES)
 
 # Choose a coordinate column from several candidates, preferring the one whose
 # values actually fall in the valid degree range.  Handles files that carry both
@@ -350,51 +366,75 @@ prep_elephant_csv <- function(file,
     d
   }
   dat <- .apply_prefilter(dat, filter_col, filter_val)
-  if (nrow(dat) == 0) return(NULL)
+  if (nrow(dat) == 0)
+    return(prep_failed(
+      if (!is.null(filter_col) && nzchar(filter_col))
+        paste0("no rows matched the pre-filter ", filter_col, " == '", filter_val, "'")
+      else "the file contains no data rows"))
 
-  # Standardize key column names
-  dat <- rename_ci(dat, "Sex",                         "sex")
-  dat <- rename_ci(dat, "Name",                        "name")
-  dat <- rename_ci(dat, "individual-local-identifier", "name")
-  dat <- rename_ci(dat, "ID_Number",                   "name")
-  dat <- rename_ci(dat, "extra__subject__name",        "name")
-  if (!any(tolower(names(dat)) %in% "name")) dat <- rename_ci(dat, "id", "name")
-  # Collar / tag identifier — becomes the individual name when no explicit name
-  # column exists (e.g. Savannah Tracking exports keyed by Tag or TagId).
-  # Guard on the exact lowercase name so a differently-cased column (e.g. "Tag")
-  # is still normalised to "tag" rather than being mistaken for an existing one.
-  if (!("tag" %in% names(dat))) {
-    .tag_col <- pick_col(names(dat), TAG_COL_CANDIDATES)
-    if (!is.na(.tag_col)) names(dat)[names(dat) == .tag_col] <- "tag"
+  # Rename a user-picked source column to a canonical name, moving any existing
+  # column of that canonical name aside first so we never create a duplicate.
+  .rename_to <- function(dat, src, canonical) {
+    src <- trimws(src %||% "")
+    if (!nzchar(src)) return(dat)
+    h <- which(tolower(names(dat)) == tolower(src))
+    if (length(h) != 1) return(dat)
+    ex <- which(tolower(names(dat)) == canonical & seq_along(names(dat)) != h)
+    if (length(ex) > 0) names(dat)[ex] <- paste0(names(dat)[ex], "_orig")
+    names(dat)[h] <- canonical
+    dat
   }
-  dat <- rename_ci(dat, "Time_Stamp",           "fixtime")
-  dat <- rename_ci(dat, "Time_stamp",           "fixtime")
-  dat <- rename_ci(dat, "Time Stamp",           "fixtime")
-  dat <- rename_ci(dat, "Timestamp",            "fixtime")
-  dat <- rename_ci(dat, "timestamp",            "fixtime")
-  dat <- rename_ci(dat, "timestamp_corrected",  "fixtime")
-  # Manual override: user-selected single combined date/time column
-  if (!"fixtime" %in% tolower(names(dat)) &&
-      !is.null(manual_datetime_col) && nzchar(trimws(manual_datetime_col))) {
-    hit <- which(tolower(names(dat)) == tolower(trimws(manual_datetime_col)))
-    if (length(hit) == 1) {
-      names(dat)[hit] <- "fixtime"
-      message("Using user-selected date/time column '", manual_datetime_col, "'")
+
+  # Standardize key column names.  A user-picked column ALWAYS wins over
+  # auto-detection — the app can't know every possible column name, so the
+  # manual picker is the authoritative override, not just a fallback.
+  dat <- rename_ci(dat, "Sex", "sex")
+
+  # ── Individual / ID column ─────────────────────────────────────────────────
+  if (!is.null(manual_id_col) && nzchar(trimws(manual_id_col))) {
+    dat <- .rename_to(dat, manual_id_col, "name")
+    message("Using user-selected ID column '", manual_id_col, "'")
+  }
+  if (!("name" %in% names(dat))) {
+    dat <- rename_ci(dat, "Name",                        "name")
+    dat <- rename_ci(dat, "individual-local-identifier", "name")
+    dat <- rename_ci(dat, "ID_Number",                   "name")
+    dat <- rename_ci(dat, "extra__subject__name",        "name")
+    if (!any(tolower(names(dat)) %in% "name")) dat <- rename_ci(dat, "id", "name")
+    # Collar / tag identifier — becomes the name when no explicit name column
+    # exists (e.g. Savannah Tracking exports keyed by Tag or TagId).
+    if (!("tag" %in% names(dat))) {
+      .tag_col <- pick_col(names(dat), TAG_COL_CANDIDATES)
+      if (!is.na(.tag_col)) names(dat)[names(dat) == .tag_col] <- "tag"
     }
   }
-  # Combine separate Date + Time columns when no combined timestamp column exists
+
+  # ── Timestamp column(s) ────────────────────────────────────────────────────
+  if (!is.null(manual_datetime_col) && nzchar(trimws(manual_datetime_col))) {
+    dat <- .rename_to(dat, manual_datetime_col, "fixtime")
+    message("Using user-selected date/time column '", manual_datetime_col, "'")
+  }
+  if (!("fixtime" %in% tolower(names(dat)))) {
+    dat <- rename_ci(dat, "Time_Stamp",          "fixtime")
+    dat <- rename_ci(dat, "Time_stamp",          "fixtime")
+    dat <- rename_ci(dat, "Time Stamp",          "fixtime")
+    dat <- rename_ci(dat, "Timestamp",           "fixtime")
+    dat <- rename_ci(dat, "timestamp",           "fixtime")
+    dat <- rename_ci(dat, "timestamp_corrected", "fixtime")
+  }
+  # Combine separate Date + Time columns when still no combined timestamp.
+  # A user-picked date/time column wins over the name-based candidates.
   if (!"fixtime" %in% tolower(names(dat))) {
-    .date_col  <- pick_col(names(dat), DATE_COL_CANDIDATES)
-    .time_col2 <- pick_col(names(dat), TIME_COL_CANDIDATES)
-    # Manual fallback: user-selected date / time columns (only when not auto-found)
-    if (is.na(.date_col) && !is.null(manual_date_col) && nzchar(trimws(manual_date_col))) {
-      hit <- which(tolower(names(dat)) == tolower(trimws(manual_date_col)))
-      if (length(hit) == 1) .date_col <- names(dat)[hit]
+    .manual_col <- function(sel) {
+      sel <- trimws(sel %||% "")
+      if (!nzchar(sel)) return(NA_character_)
+      h <- which(tolower(names(dat)) == tolower(sel))
+      if (length(h) == 1) names(dat)[h] else NA_character_
     }
-    if (is.na(.time_col2) && !is.null(manual_time_col) && nzchar(trimws(manual_time_col))) {
-      hit <- which(tolower(names(dat)) == tolower(trimws(manual_time_col)))
-      if (length(hit) == 1) .time_col2 <- names(dat)[hit]
-    }
+    .date_col  <- .manual_col(manual_date_col)
+    .time_col2 <- .manual_col(manual_time_col)
+    if (is.na(.date_col))  .date_col  <- pick_col(names(dat), DATE_COL_CANDIDATES)
+    if (is.na(.time_col2)) .time_col2 <- pick_col(names(dat), TIME_COL_CANDIDATES)
     if (!is.na(.date_col) && !is.na(.time_col2)) {
       dat$fixtime <- .combine_date_time(dat[[.date_col]], dat[[.time_col2]])
       message("Combined '", .date_col, "' + '", .time_col2,
@@ -407,15 +447,6 @@ prep_elephant_csv <- function(file,
   if (!("name" %in% names(dat))) {
     nm_x <- pick_col(names(dat), c("name.x", "name.y"))
     if (!is.na(nm_x)) names(dat)[tolower(names(dat)) == tolower(nm_x)] <- "name"
-  }
-  # Manual override: user-selected ID column (only used when nothing above matched)
-  if (!("name" %in% names(dat)) &&
-      !is.null(manual_id_col) && nzchar(trimws(manual_id_col))) {
-    hit <- which(tolower(names(dat)) == tolower(trimws(manual_id_col)))
-    if (length(hit) == 1) {
-      names(dat)[hit] <- "name"
-      message("Using user-selected ID column '", manual_id_col, "' as individual name")
-    }
   }
   # No individual identifier could be resolved — ask the user to map one.
   if (!("name" %in% names(dat))) {
@@ -446,12 +477,9 @@ prep_elephant_csv <- function(file,
 
   if (!species_present) {
     # No usable species column — user confirmed all rows are elephant via UI
-    if (!all_elephant) {
-      message("Skipping ", basename(file),
-              ": no usable species column (missing or empty) and ",
-              "'All rows are elephant' was not confirmed")
-      return(NULL)
-    }
+    if (!all_elephant)
+      return(prep_failed(
+        "no usable species column (missing or empty) — tick 'All rows in this file are elephant'"))
     dat$species <- "elephant"
 
   } else {
@@ -485,10 +513,11 @@ prep_elephant_csv <- function(file,
   dat_ele <- dat
   rm(dat); gc()
 
-  if (nrow(dat_ele) == 0) {
-    message("Skipping ", basename(file), ": no rows remain after species filter")
-    return(NULL)
-  }
+  if (nrow(dat_ele) == 0)
+    return(prep_failed(paste0(
+      "no elephant rows remained after species filtering — if this file holds only ",
+      "elephants, tick 'All rows in this file are elephant' or 'Include rows where ",
+      "species is blank / NA'")))
 
   # Fast exact-string dedup on name + raw timestamp before any expensive
   # parsing or sf creation. Removes re-exported overlapping rows in O(n).
@@ -518,23 +547,22 @@ prep_elephant_csv <- function(file,
     TRUE                               ~ dat_ele$sex
   )
 
-  # Geometry: lat/lon takes priority over WKT.  Value-aware pick so that files
-  # carrying both decimal degrees and UTM under similar names choose the degrees.
+  # Geometry: lat/lon takes priority over WKT.  A user-picked column ALWAYS wins;
+  # otherwise a value-aware pick chooses the pair whose values are in valid degree
+  # range (so files carrying both decimal degrees and UTM pick the degrees).
   has_wkt <- wkt_col %in% names(dat_ele)
-  lat_col <- .pick_coord_col(dat_ele, LAT_COL_CANDIDATES,  -90,  90)
-  lon_col <- .pick_coord_col(dat_ele, LON_COL_CANDIDATES, -180, 180)
-
-  # Manual override: user-selected lat/lon columns (only when auto-detection failed)
-  if (is.na(lat_col) && !is.null(manual_lat_col) && nzchar(trimws(manual_lat_col))) {
-    hit <- which(tolower(names(dat_ele)) == tolower(trimws(manual_lat_col)))
-    if (length(hit) == 1) lat_col <- names(dat_ele)[hit]
+  .manual_coord <- function(sel) {
+    sel <- trimws(sel %||% "")
+    if (!nzchar(sel)) return(NA_character_)
+    h <- which(tolower(names(dat_ele)) == tolower(sel))
+    if (length(h) == 1) names(dat_ele)[h] else NA_character_
   }
-  if (is.na(lon_col) && !is.null(manual_lon_col) && nzchar(trimws(manual_lon_col))) {
-    hit <- which(tolower(names(dat_ele)) == tolower(trimws(manual_lon_col)))
-    if (length(hit) == 1) lon_col <- names(dat_ele)[hit]
-  }
-  if (!is.na(lat_col) && !is.na(lon_col) &&
-      (!is.null(manual_lat_col) && nzchar(trimws(manual_lat_col))))
+  lat_col <- .manual_coord(manual_lat_col)
+  lon_col <- .manual_coord(manual_lon_col)
+  manual_coords <- !is.na(lat_col) || !is.na(lon_col)
+  if (is.na(lat_col)) lat_col <- .pick_coord_col(dat_ele, LAT_COL_CANDIDATES,  -90,  90)
+  if (is.na(lon_col)) lon_col <- .pick_coord_col(dat_ele, LON_COL_CANDIDATES, -180, 180)
+  if (!is.na(lat_col) && !is.na(lon_col) && manual_coords)
     message("Using user-selected coordinate columns '", lat_col, "' / '", lon_col, "'")
 
   if (!is.na(lat_col) && !is.na(lon_col)) {
@@ -546,7 +574,10 @@ prep_elephant_csv <- function(file,
       dplyr::filter(!is.na(lat), !is.na(long),
                     long > -180, long < 180, lat > -90, lat < 90,
                     !(long == 0 & lat == 0))
-    if (nrow(dat_ele2) == 0) { message("Skipping: invalid coordinates"); return(NULL) }
+    if (nrow(dat_ele2) == 0)
+      return(prep_failed(paste0(
+        "every latitude/longitude value in '", lat_col, "' / '", lon_col,
+        "' was missing, non-numeric, out of range, or (0, 0) — check the coordinate columns")))
     dat_sf <- dat_ele2 %>%
       sf::st_as_sf(coords = c("long", "lat"), crs = 4326, remove = FALSE) %>%
       dplyr::mutate(lon = long)
@@ -554,7 +585,8 @@ prep_elephant_csv <- function(file,
 
   } else if (has_wkt) {
     dat_ele <- dat_ele %>% dplyr::filter(!is_zero_wkt(.data[[wkt_col]]))
-    if (nrow(dat_ele) == 0) { message("Skipping: zero/blank WKT"); return(NULL) }
+    if (nrow(dat_ele) == 0)
+      return(prep_failed("every geometry (WKT) value was empty or (0 0)"))
     dat_sf  <- dat_ele %>%
       sf::st_as_sf(wkt = wkt_col, crs = crs_in) %>%
       dplyr::filter(!sf::st_is_empty(geometry))
@@ -579,7 +611,8 @@ prep_elephant_csv <- function(file,
         ) %>%
         dplyr::filter(!is.na(.x), !is.na(.y))
 
-      if (nrow(dat_ele2) == 0) { message("Skipping: no valid x/y values"); return(NULL) }
+      if (nrow(dat_ele2) == 0)
+        return(prep_failed(paste0("no numeric x/y values in '", x_col, "' / '", y_col, "'")))
       rm(dat_ele); gc()
 
       # Check if x/y values are in degree range (lon/lat) rather than UTM metres
@@ -600,10 +633,10 @@ prep_elephant_csv <- function(file,
         else
           detect_utm_epsg(dat_ele2$.x, dat_ele2$.y)
 
-        if (is.na(epsg)) {
-          message("Skipping: could not auto-detect CRS for x/y columns — specify EPSG manually")
-          return(NULL)
-        }
+        if (is.na(epsg))
+          return(prep_failed(paste0(
+            "could not auto-detect the projection (CRS) for x/y columns '", x_col, "' / '",
+            y_col, "' — set the input CRS EPSG on the left, then Prepare again")))
         message("x/y columns detected — using EPSG ", epsg)
 
         wgs    <- sf::st_as_sf(dat_ele2, coords = c(".x", ".y"), crs = epsg) %>%
@@ -626,7 +659,8 @@ prep_elephant_csv <- function(file,
     }
   }
 
-  if (nrow(dat_sf) == 0) { message("Skipping: no valid coordinates"); return(NULL) }
+  if (nrow(dat_sf) == 0)
+    return(prep_failed("no valid coordinates remained after parsing"))
 
   # ── Standardise coordinate columns ────────────────────────────────────────
   # Drop source-specific column name variants so that bind_rows across files
@@ -696,6 +730,16 @@ prep_elephant_csv <- function(file,
       ),
       tz = "UTC", train = FALSE)
   )
+
+  # If not a single timestamp parsed, the date/time format is unrecognised —
+  # surface it clearly rather than silently dropping every row.
+  if (all(is.na(ts_utc))) {
+    .eg <- utils::head(ts_raw[!is.na(ts_raw) & nzchar(trimws(ts_raw))], 1)
+    return(prep_failed(paste0(
+      "could not parse any timestamps",
+      if (length(.eg) == 1) paste0(" (e.g. '", .eg, "')") else "",
+      " — the date/time format is unrecognised")))
+  }
 
   # Timezone from a sample of coordinates (majority vote; all points in one
   # study area share a timezone so sampling 500 is sufficient).

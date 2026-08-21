@@ -382,95 +382,51 @@ mod_ingest_server <- function(id, rv, parent_session) {
               )
             },
 
-            # ── Manual column mapping (shown when auto-detection fails, or when
-            #    a Prepare attempt could not resolve the columns for this file) ──
-            if (!still_load && length(all_cols) > 0 &&
-                (need_id || need_coord || need_ts)) {
-              needs <- c(if (need_id) "an ID column",
-                         if (need_coord) "coordinate columns",
-                         if (need_ts) "date & time columns")
-              tagList(
-                tags$hr(style = "margin:0.5rem 0;"),
-                tags$p(
-                  style = "font-weight:600; font-size:0.78rem; color:#b9770e; margin-bottom:0.4rem;",
-                  paste0("⚠ Could not auto-detect ",
-                         paste(needs, collapse = ", "),
-                         " — please select below.")
-                ),
-                if (need_id)
-                  selectizeInput(
-                    session$ns(paste0("id_col_", i)),
-                    "ID / individual column",
-                    choices  = c("--- select ---" = "", all_cols),
-                    selected = "",
-                    width    = "100%",
-                    options  = list(placeholder = "--- select ---", maxOptions = 300)
-                  ),
-                if (need_coord)
-                  div(
-                    class = "prefilter-pair",
-                    style = "display:flex; gap:0.5rem; align-items:flex-start;",
-                    div(style = "flex:1; min-width:0;",
-                      selectizeInput(
-                        session$ns(paste0("lat_col_", i)),
-                        "Latitude column",
-                        choices  = c("--- select ---" = "", all_cols),
-                        selected = "",
-                        width    = "100%",
-                        options  = list(placeholder = "--- select ---", maxOptions = 300)
-                      )
-                    ),
-                    div(style = "flex:1; min-width:0;",
-                      selectizeInput(
-                        session$ns(paste0("lon_col_", i)),
-                        "Longitude column",
-                        choices  = c("--- select ---" = "", all_cols),
-                        selected = "",
-                        width    = "100%",
-                        options  = list(placeholder = "--- select ---", maxOptions = 300)
-                      )
-                    )
-                  ),
-                if (need_ts)
-                  tagList(
-                    selectizeInput(
-                      session$ns(paste0("datetime_col_", i)),
-                      "Combined date & time column",
-                      choices  = c("--- select ---" = "", all_cols),
-                      selected = "",
-                      width    = "100%",
-                      options  = list(placeholder = "--- select ---", maxOptions = 300)
-                    ),
-                    tags$p(style = "font-size:0.72rem; color:#6c757d; text-align:center; margin:0.1rem 0;",
-                           "— or, if date and time are in separate columns —"),
-                    div(
-                      class = "prefilter-pair",
-                      style = "display:flex; gap:0.5rem; align-items:flex-start;",
-                      div(style = "flex:1; min-width:0;",
-                        selectizeInput(
-                          session$ns(paste0("date_col_", i)),
-                          "Date column",
-                          choices  = c("--- select ---" = "", all_cols),
-                          selected = "",
-                          width    = "100%",
-                          options  = list(placeholder = "--- select ---", maxOptions = 300)
-                        )
-                      ),
-                      div(style = "flex:1; min-width:0;",
-                        selectizeInput(
-                          session$ns(paste0("time_col_", i)),
-                          "Time column",
-                          choices  = c("--- select ---" = "", all_cols),
-                          selected = "",
-                          width    = "100%",
-                          options  = list(placeholder = "--- select ---", maxOptions = 300)
-                        )
-                      )
-                    ),
-                    helpText(style = "font-size:0.72rem; margin-top:-0.2rem;",
-                             "Pick the single column holding the full timestamp, or a",
-                             "date column and a time column to combine.")
-                  )
+            # ── Column mapping (ALWAYS available) ─────────────────────────────
+            # Auto-detected columns are shown as hints; leave a picker on
+            # "use auto-detection" to keep them, or choose a column to override —
+            # the app can't know every possible column name, so this always works.
+            # Auto-opens when a column couldn't be detected (or a prior Prepare
+            # attempt flagged it).
+            if (!still_load && length(all_cols) > 0) {
+              id_auto   <- resolve_name_col(all_cols)
+              lat_auto  <- .pick_coord_col(samp, LAT_COL_CANDIDATES,  -90,  90)
+              lon_auto  <- .pick_coord_col(samp, LON_COL_CANDIDATES, -180, 180)
+              dt_auto   <- resolve_datetime_col(all_cols)
+              date_auto <- resolve_date_col(all_cols)
+              time_auto <- resolve_time_col(all_cols)
+              open_now  <- need_id || need_coord || need_ts
+
+              .hint   <- function(base, auto)
+                paste0(base, if (!is.na(auto)) paste0("  (auto: ", auto, ")")
+                             else "  (none detected)")
+              .picker <- function(idsuffix, base, auto)
+                selectInput(session$ns(paste0(idsuffix, i)), .hint(base, auto),
+                            choices  = c("Use auto-detection" = "", all_cols),
+                            selected = "", width = "100%")
+
+              tags$details(
+                open  = if (open_now) "open" else NULL,
+                style = "border:1px solid #dee2e6; border-radius:6px; padding:0.4rem 0.6rem; margin:0.5rem 0;",
+                tags$summary(
+                  style = paste0("cursor:pointer; font-weight:600; font-size:0.8rem;",
+                                 if (open_now) " color:#b9770e;" else ""),
+                  if (open_now) "⚠ Column mapping — some columns need selecting"
+                  else "Column mapping (auto-detected — click to override)"),
+                helpText(style = "font-size:0.72rem; margin:0.3rem 0;",
+                         "Leave a picker on “Use auto-detection” to keep the column",
+                         "shown in its label. Choose a column to override it — this always",
+                         "wins over auto-detection."),
+                .picker("id_col_", "Individual / ID column", id_auto),
+                div(class = "prefilter-pair", style = "display:flex; gap:0.5rem;",
+                    div(style = "flex:1; min-width:0;", .picker("lat_col_", "Latitude",  lat_auto)),
+                    div(style = "flex:1; min-width:0;", .picker("lon_col_", "Longitude", lon_auto))),
+                .picker("datetime_col_", "Combined date & time column", dt_auto),
+                tags$p(style = "font-size:0.72rem; color:#6c757d; text-align:center; margin:0.1rem 0;",
+                       "— or, if date and time are in separate columns —"),
+                div(class = "prefilter-pair", style = "display:flex; gap:0.5rem;",
+                    div(style = "flex:1; min-width:0;", .picker("date_col_", "Date", date_auto)),
+                    div(style = "flex:1; min-width:0;", .picker("time_col_", "Time", time_auto)))
               )
             },
 
@@ -655,9 +611,10 @@ mod_ingest_server <- function(id, rv, parent_session) {
                 manual_time_col    = if (nzchar(time_sel)) time_sel else NULL,
                 manual_datetime_col = if (nzchar(dt_sel))  dt_sel   else NULL
               )
-              # prep couldn't resolve a required column class — pass the signal
-              # straight through so the run handler can force the manual picker.
-              if (is_need_mapping(prepped)) return(prepped)
+              # prep couldn't resolve a required column class, or failed for a
+              # data reason — pass the signal straight through so the run handler
+              # can force the picker / report the reason per file.
+              if (is_need_mapping(prepped) || is_prep_failed(prepped)) return(prepped)
               # Apply name corrections per-file so that combine_prepped sees
               # canonical names and its rolling 5-minute dedup correctly merges
               # near-duplicate fixes from sources that used different name conventions.
@@ -686,16 +643,37 @@ mod_ingest_server <- function(id, rv, parent_session) {
             error = function(e) {
               message("ERROR in prep_elephant_csv (", file_names[i], "): ",
                       conditionMessage(e))
-              NULL
+              prep_failed(paste0("unexpected error — ", conditionMessage(e)))
             })
           })
 
-          # Intercept files prep couldn't resolve: force their manual pickers open
-          # (keyed by file index) instead of dead-ending on an error.
+          # ── Report per-file outcomes ──────────────────────────────────────
+          # Files fall into three buckets: need a manual column mapping, failed
+          # for a data reason, or prepared successfully.  Make every non-success
+          # explicit so the user knows exactly what went wrong, and for which file.
           reasons  <- vapply(prepped_list,
                              function(x) if (is_need_mapping(x)) x$reason else NA_character_,
                              character(1))
+          fail_msg <- vapply(prepped_list,
+                             function(x) if (is_prep_failed(x)) x$message else NA_character_,
+                             character(1))
           need_idx <- which(!is.na(reasons))
+          fail_idx <- which(!is.na(fail_msg))
+
+          # Files that failed for a data reason (picker can't fix) — report each.
+          if (length(fail_idx) > 0) {
+            fitems <- vapply(fail_idx, function(k)
+              paste0("‘", file_names[k], "’ — ", fail_msg[k]), character(1))
+            showNotification(
+              tags$div(
+                tags$b("Some files could not be prepared:"),
+                tags$ul(lapply(fitems, tags$li))
+              ),
+              type = "error", duration = NULL
+            )
+          }
+
+          # Files needing a manual column mapping — open their pickers.
           if (length(need_idx) > 0) {
             mf <- as.list(reasons[need_idx]); names(mf) <- as.character(need_idx)
             manual_force(mf)
@@ -707,22 +685,36 @@ mod_ingest_server <- function(id, rv, parent_session) {
               tags$div(
                 tags$b("Some columns couldn’t be identified automatically."),
                 tags$br(),
-                "Please map them in the per-file settings, then click Prepare again:",
+                "Open ‘Column mapping’ in the per-file settings, choose the column(s), ",
+                "then click Prepare again:",
                 tags$ul(lapply(items, tags$li))
               ),
               type = "warning", duration = NULL
             )
             session$sendCustomMessage("scrollToId",
                                       list(id = session$ns("per_file_ui")))
-            return()
+            return()   # wait for the user to map before combining
           }
 
+          # Keep only successfully prepared (sf) files.
+          prepped_list <- prepped_list[is.na(reasons) & is.na(fail_msg)]
           prepped_list <- Filter(Negate(is.null), prepped_list)
 
           if (length(prepped_list) == 0) {
-            showNotification("No valid data could be prepared.", type = "error")
+            showNotification(
+              if (length(fail_idx) > 0)
+                "No files could be prepared — see the reason(s) above."
+              else "No valid data could be prepared.",
+              type = "error", duration = 10
+            )
             return()
           }
+          if (length(fail_idx) > 0)
+            showNotification(
+              sprintf("Prepared %d of %d file(s); the rest are listed above.",
+                      length(prepped_list), n_files),
+              type = "warning", duration = 8
+            )
 
           setProgress(value = 0.95, message = "Combining files…",
                       detail = "cross-file deduplication")
