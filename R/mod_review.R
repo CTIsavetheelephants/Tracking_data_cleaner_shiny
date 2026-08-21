@@ -85,6 +85,18 @@ mod_review_ui <- function(id) {
         )
       ),
 
+      # ── Preview on the map (non-destructive) ────────────────────────────
+      tags$p(style = "font-size:0.72rem; color:#6c757d; margin:0.5rem 0 0.2rem;",
+             "Preview the cleaned track on the map before committing — this does",
+             "not remove anything until you press Confirm."),
+      div(class = "d-flex gap-1",
+          actionButton(ns("preview_flags"),  "Remove selected flags from map",
+                       class = "btn-outline-info btn-sm flex-fill"),
+          actionButton(ns("preview_manual"), "Remove manual selections from map",
+                       class = "btn-outline-info btn-sm flex-fill")),
+      actionButton(ns("reset_preview"), "Reset map preview",
+                   class = "btn-outline-secondary btn-sm w-100 mt-1"),
+
       actionButton(ns("confirm"), "Confirm & advance to next",
                    class = "btn-success w-100 mt-2"),
       div(class = "d-flex gap-1 mt-1",
@@ -104,8 +116,10 @@ mod_review_ui <- function(id) {
         "Coloured points show the automatic flags (see legend). To remove fixes the",
         "flags missed: click a point, or click the", tags$b("rectangle icon"),
         "top-left and drag a box — staged fixes turn",
-        tags$b(style = paste0("color:", MANUAL_SEL_COLOUR), "magenta"),
-        "and are removed when you press Confirm."),
+        tags$b(style = paste0("color:", MANUAL_SEL_COLOUR), "magenta"), ".",
+        "Use the", tags$b("Remove … from map"), "buttons on the left to preview the",
+        "cleaned track first; nothing is committed until you press",
+        tags$b("Confirm & advance"), "."),
       leafletOutput(ns("map"), height = "600px")
     )
   ) # close layout_columns
@@ -115,7 +129,8 @@ mod_review_ui <- function(id) {
 mod_review_server <- function(id, rv, parent_session) {
   moduleServer(id, function(input, output, session) {
 
-    sel <- reactiveVal(character(0))  # staged manual point IDs (name|timestamp)
+    sel            <- reactiveVal(character(0))  # staged manual point IDs (name|timestamp)
+    preview_hidden <- reactiveVal(character(0))  # point IDs hidden on the map for preview only
 
     # ── Individual list ────────────────────────────────────────────────────
     observe({
@@ -279,40 +294,45 @@ mod_review_server <- function(id, rv, parent_session) {
         )
     })
 
-    # Full re-render with fitBounds — fires when the individual changes.
-    # Pre-populate the manual selection with any removals already staged for
-    # this individual so returning shows (and can re-adjust) them.
-    observeEvent(input$individual, {
-      req(nzchar(input$individual %||% ""))
-      sel(manual_ids_for(input$individual))
-
-      d_pts <- d_pts_data()
-      req(nrow(d_pts) > 0)
-
-      # Zoom to 5th–95th percentile so outlier flags don't stretch the view.
-      lon_q <- stats::quantile(d_pts$lon_wgs, c(0.05, 0.95), na.rm = TRUE)
-      lat_q <- stats::quantile(d_pts$lat_wgs, c(0.05, 0.95), na.rm = TRUE)
-
-      proxy <- leafletProxy(session$ns("map"), session) %>%
-        clearShapes() %>%
-        clearMarkers()
-      proxy <- .draw_track(proxy, d_pts)
-      .draw_points(proxy, d_pts, sel()) %>%
-        fitBounds(
-          lng1 = lon_q[[1]] - 0.05, lat1 = lat_q[[1]] - 0.05,
-          lng2 = lon_q[[2]] + 0.05, lat2 = lat_q[[2]] + 0.05
-        )
-    }, ignoreNULL = TRUE, ignoreInit = TRUE)
-
-    # Light redraw (no zoom reset) when the manual selection changes.
-    observeEvent(sel(), {
+    # Redraw the track + markers, excluding any points hidden for preview so the
+    # user sees the cleaned trajectory.  `fit = TRUE` re-zooms (used on individual
+    # change); preview / selection changes redraw without moving the view.
+    .render_map <- function(fit = FALSE) {
       d_pts <- tryCatch(d_pts_data(), error = function(e) NULL)
       req(!is.null(d_pts), nrow(d_pts) > 0)
+      vis   <- d_pts[!(d_pts$point_id %in% preview_hidden()), , drop = FALSE]
+
       proxy <- leafletProxy(session$ns("map"), session) %>%
         clearShapes() %>%
         clearMarkers()
-      proxy <- .draw_track(proxy, d_pts)
-      .draw_points(proxy, d_pts, sel())
+      proxy <- .draw_track(proxy, vis)
+      proxy <- .draw_points(proxy, vis, sel())
+
+      if (fit) {
+        # Zoom to 5th–95th percentile of ALL points so the view is stable.
+        lon_q <- stats::quantile(d_pts$lon_wgs, c(0.05, 0.95), na.rm = TRUE)
+        lat_q <- stats::quantile(d_pts$lat_wgs, c(0.05, 0.95), na.rm = TRUE)
+        proxy <- proxy %>%
+          fitBounds(lng1 = lon_q[[1]] - 0.05, lat1 = lat_q[[1]] - 0.05,
+                    lng2 = lon_q[[2]] + 0.05, lat2 = lat_q[[2]] + 0.05)
+      }
+      proxy
+    }
+
+    # Full re-render with fitBounds — fires when the individual changes.  Clears
+    # any preview and pre-populates the manual selection with removals already
+    # staged for this individual so returning shows (and can re-adjust) them.
+    observeEvent(input$individual, {
+      req(nzchar(input$individual %||% ""))
+      preview_hidden(character(0))
+      sel(manual_ids_for(input$individual))
+      req(nrow(d_pts_data()) > 0)
+      .render_map(fit = TRUE)
+    }, ignoreNULL = TRUE, ignoreInit = TRUE)
+
+    # Light redraw (no zoom reset) when the selection or the preview changes.
+    observeEvent(list(sel(), preview_hidden()), {
+      .render_map(fit = FALSE)
     }, ignoreInit = TRUE)
 
     # ── Click to select (+ all points within 10 m) ────────────────────────
@@ -376,6 +396,40 @@ mod_review_server <- function(id, rv, parent_session) {
 
     observeEvent(input$clear_selected, { sel(character(0)) })
 
+    # Flag types currently ticked in the "Confirm flag removals" checkboxes.
+    .checked_flag_types <- function() {
+      c(if (isTRUE(input$rm_vehicle))  "suspicious_vehicle",
+        if (isTRUE(input$rm_airborne)) "suspicious_airborne",
+        if (isTRUE(input$rm_predep))   "predeployment",
+        if (isTRUE(input$rm_immobile)) "immobility",
+        if (isTRUE(input$rm_shift))    "shift_episode")
+    }
+
+    # ── Map preview (non-destructive) ──────────────────────────────────────
+    # Hide points from the map so the user can see the cleaned trajectory before
+    # committing.  Nothing is removed until Confirm.
+    observeEvent(input$preview_flags, {
+      d_pts <- tryCatch(d_pts_data(), error = function(e) NULL)
+      req(!is.null(d_pts))
+      ids <- d_pts$point_id[d_pts$flag_type %in% .checked_flag_types()]
+      if (length(ids) == 0) {
+        showNotification("No flagged fixes of the ticked types to remove.", type = "warning")
+        return()
+      }
+      preview_hidden(union(preview_hidden(), ids))
+    })
+
+    observeEvent(input$preview_manual, {
+      if (length(sel()) == 0) {
+        showNotification("No manual selection to remove — click points or draw a box first.",
+                         type = "warning")
+        return()
+      }
+      preview_hidden(union(preview_hidden(), sel()))
+    })
+
+    observeEvent(input$reset_preview, { preview_hidden(character(0)) })
+
     output$selected_info <- renderUI({
       n <- length(sel())
       if (n == 0) return(tags$p(class = "text-muted", style = "font-size:0.82rem; margin:0.2rem 0",
@@ -390,12 +444,7 @@ mod_review_server <- function(id, rv, parent_session) {
       req(nzchar(input$individual %||% ""))
       d <- ind_data()
 
-      flag_types_to_remove <- character(0)
-      if (input$rm_vehicle)  flag_types_to_remove <- c(flag_types_to_remove, "suspicious_vehicle")
-      if (input$rm_airborne) flag_types_to_remove <- c(flag_types_to_remove, "suspicious_airborne")
-      if (input$rm_predep)   flag_types_to_remove <- c(flag_types_to_remove, "predeployment")
-      if (input$rm_immobile) flag_types_to_remove <- c(flag_types_to_remove, "immobility")
-      if (input$rm_shift)    flag_types_to_remove <- c(flag_types_to_remove, "shift_episode")
+      flag_types_to_remove <- .checked_flag_types()
 
       new_flag <- d %>%
         sf::st_drop_geometry() %>%
