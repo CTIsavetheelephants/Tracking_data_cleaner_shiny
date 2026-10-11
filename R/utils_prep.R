@@ -687,8 +687,18 @@ prep_elephant_csv <- function(file,
   }
   ts_raw <- as.character(dat_sf[[time_col]])
 
+  # Rows whose raw time is unambiguously UTC are treated as UTC whatever the
+  # UTC/local setting says: an explicit UTC marker (Z, UTC, +00:00), or a
+  # Movebank export, whose `timestamp` column is always UTC (local time is in
+  # study-local-timestamp).  Previously local mode stripped these markers and
+  # shifted UTC data early by the local offset (e.g. Kasungu, Etosha, Dzanga).
+  movebank_utc <- any(gsub("[^a-z]", "", tolower(names(dat_sf))) == "studylocaltimestamp")
+  row_utc <- if (movebank_utc) rep(TRUE, length(ts_raw)) else
+    grepl("(Z|UTC|[+-]00:?00)$", trimws(ts_raw), ignore.case = TRUE)
+  is_utc <- timestamps_utc | row_utc
+
   # When timestamps are declared as LOCAL time, strip any embedded UTC offset
-  # (e.g. "+02:00", "+0200", "Z") before parsing.  Movebank exports vary: some
+  # (e.g. "+02:00", "+0200") before parsing.  Movebank exports vary: some
   # include an explicit offset in the fixtime string, some do not.  The format-
   # based parser used in Prepping_data.R (as.POSIXct with a format string) silently
   # ignores trailing offset characters, so both "18:04:28" and "18:04:28+02:00"
@@ -696,9 +706,9 @@ prep_elephant_csv <- function(file,
   # applies the offset, shifting the UTC instant by 2 h — causing the same physical
   # fix to get two different timestamp_corrected values across files and breaking
   # deduplication.  Stripping the offset here makes the app match the merge script.
-  if (!timestamps_utc) {
-    ts_raw <- sub("\\s*[Zz]$", "", ts_raw)                     # trailing Z (UTC marker)
-    ts_raw <- sub("\\s*[+-]\\d{2}:?\\d{2}$", "", ts_raw)       # trailing ±HH:MM or ±HHMM
+  # (Only local rows: explicit-UTC rows keep their marker.)
+  if (any(!is_utc)) {
+    ts_raw[!is_utc] <- sub("\\s*[+-]\\d{2}:?\\d{2}$", "", ts_raw[!is_utc])  # trailing ±HH:MM or ±HHMM
   }
   ts_utc <- suppressWarnings(
     lubridate::parse_date_time(ts_raw,
@@ -754,17 +764,19 @@ prep_elephant_csv <- function(file,
   # Local timestamps: the string was already local time but parsed as UTC
   # (wrong label, right clock digits); force_tz reassigns the timezone label
   # without shifting, correcting the instant (10:00 "UTC" → 10:00 EAT = 08:00 UTC).
-  ts_corrected <- if (timestamps_utc)
-    lubridate::with_tz(ts_utc,   tzone = tz_mode)
-  else
-    lubridate::force_tz(ts_utc,  tzone = tz_mode)
+  # Applied per row, so explicit-UTC rows are never shifted in local mode.
+  ts_corrected <- lubridate::with_tz(ts_utc, tzone = tz_mode)
+  if (any(!is_utc))
+    ts_corrected[!is_utc] <- lubridate::force_tz(ts_utc[!is_utc], tzone = tz_mode)
 
+  # month/day follow the UTC calendar, matching timestamp_corrected as written
+  # to the exported CSV (the in-app POSIXct carries the local tz label).
   out <- dat_sf %>%
     dplyr::mutate(
       timestamp_corrected = ts_corrected,
       tz    = tz_mode,
-      month = lubridate::month(timestamp_corrected),
-      day   = lubridate::day(timestamp_corrected)
+      month = lubridate::month(lubridate::with_tz(timestamp_corrected, "UTC")),
+      day   = lubridate::day(lubridate::with_tz(timestamp_corrected, "UTC"))
     ) %>%
     dplyr::filter(!is.na(timestamp_corrected)) %>%
     .dedup_consecutive("name", "timestamp_corrected", min_gap_mins = 5) %>%
